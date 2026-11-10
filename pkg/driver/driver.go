@@ -250,7 +250,8 @@ type Driver struct {
 	metrics     *Metrics
 	metricsAddr string
 
-	mountHeal MountHealConfig
+	mountHeal               MountHealConfig
+	iscsiReplacementTimeout time.Duration
 
 	controllerCaps []*csi.ControllerServiceCapability
 	nodeCaps       []*csi.NodeServiceCapability
@@ -306,6 +307,11 @@ type DriverConfig struct {
 	// MountHeal configures the node plugin's mount healer. A zero Interval leaves
 	// it disabled.
 	MountHeal MountHealConfig
+
+	// ISCSIReplacementTimeout is how long the kernel keeps I/O queued for an iSCSI
+	// session whose connection dropped, before failing it to the filesystem. Zero
+	// leaves the host's setting.
+	ISCSIReplacementTimeout time.Duration
 
 	// Logger is the structured logger for the driver and client.
 	// If not set, logging for the client will be disabled.
@@ -517,6 +523,8 @@ func NewDriver(config *DriverConfig) (*Driver, error) {
 		metrics:       metrics,
 		metricsAddr:   config.MetricsAddr,
 		mountHeal:     config.MountHeal,
+
+		iscsiReplacementTimeout: config.ISCSIReplacementTimeout,
 	}
 
 	if err := d.metrics.RegisterConnectionState(truenasClient.Connected, truenasClient.Reconnects); err != nil {
@@ -607,6 +615,10 @@ func (d *Driver) Run(ctx context.Context) error {
 	// earlier versions left. In the background, so volumes are served meanwhile.
 	if controller, ok := d.controllerServer.(*ControllerServer); ok {
 		go controller.sweepCloneSnapshots(ctx)
+	}
+
+	if node, ok := d.nodeServer.(*NodeServer); ok {
+		go node.iscsiHandler.applyReplacementTimeoutToStagedVolumes()
 	}
 
 	if node, ok := d.nodeServer.(*NodeServer); ok && d.mountHeal.Interval > 0 {

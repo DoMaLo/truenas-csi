@@ -169,7 +169,10 @@ func TestScan_IntentionallyReadOnlyMountIsLeftAlone(t *testing.T) {
 
 func TestScan_WaitsWhileStorageIsUnreachable(t *testing.T) {
 	stubStatfs(t, 0, nil)
-	stubMountProbe(t, syscall.EIO)
+	probed := 0
+	orig := probeMount
+	probeMount = func(string) error { probed++; return syscall.EIO }
+	t.Cleanup(func() { probeMount = orig })
 	f := newHealerFixture(t, stagedWithConsumer("/dev/sdb"), controlledPod("loki-0"))
 	f.reachable = false
 
@@ -177,11 +180,27 @@ func TestScan_WaitsWhileStorageIsUnreachable(t *testing.T) {
 	if len(f.pods.deleted) != 0 {
 		t.Fatalf("pods must not be restarted while storage is unreachable, deleted = %v", f.pods.deleted)
 	}
+	if probed != 0 {
+		t.Errorf("mount probed %d times while storage was unreachable; a read then hangs in the kernel", probed)
+	}
 
 	f.reachable = true
 	f.healer.scan(context.Background())
 	if len(f.pods.deleted) != 1 {
 		t.Errorf("pods must be restarted once storage is back, deleted = %v", f.pods.deleted)
+	}
+}
+
+func TestScan_DeletesOperatorManagedPods(t *testing.T) {
+	stubStatfs(t, 0, nil)
+	stubMountProbe(t, syscall.EIO)
+	// lmt-nodes-0 (StrimziPodSet) was among the pods broken by the outage.
+	f := newHealerFixture(t, stagedWithConsumer("/dev/sdb"),
+		healPod{Namespace: "monitoring", Name: "lmt-nodes-0", UID: testPodUID, Controlled: true})
+
+	f.healer.scan(context.Background())
+	if !slices.Equal(f.pods.deleted, []string{"monitoring/lmt-nodes-0"}) {
+		t.Errorf("deleted = %v, want [monitoring/lmt-nodes-0]", f.pods.deleted)
 	}
 }
 

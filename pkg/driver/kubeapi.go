@@ -21,15 +21,12 @@ const kubeAPIRequestTimeout = 15 * time.Second
 // serviceAccountDir is overridable in tests.
 var serviceAccountDir = "/var/run/secrets/kubernetes.io/serviceaccount"
 
-// restartingOwnerKinds are the controllers known to recreate a pod that is
-// deleted. Other owners are not trusted to: a mirror pod of a static pod is owned
-// by its Node as a controller, and deleting it restarts nothing.
-var restartingOwnerKinds = map[string]bool{
-	"ReplicaSet":            true,
-	"StatefulSet":           true,
-	"DaemonSet":             true,
-	"Job":                   true,
-	"ReplicationController": true,
+// recreatesPod reports whether a pod's controller recreates it once deleted. Any
+// workload controller does, operators included (Strimzi's StrimziPodSet,
+// CloudNativePG's Cluster). A static pod's mirror is the exception: the Node is
+// its controller, and deleting the mirror restarts nothing.
+func recreatesPod(ownerKind string) bool {
+	return ownerKind != "Node"
 }
 
 // healPod is the part of a pod the mount healer needs.
@@ -141,7 +138,7 @@ func (a *inClusterPodAPI) ListNodePods(ctx context.Context, nodeName string) ([]
 			Terminating: item.Metadata.DeletionTimestamp != nil,
 		}
 		for _, ref := range item.Metadata.OwnerReferences {
-			if ref.Controller != nil && *ref.Controller && restartingOwnerKinds[ref.Kind] {
+			if ref.Controller != nil && *ref.Controller && recreatesPod(ref.Kind) {
 				pod.Controlled = true
 			}
 		}

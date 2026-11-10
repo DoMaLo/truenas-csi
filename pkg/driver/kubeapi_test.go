@@ -36,7 +36,11 @@ const podListJSON = `{"items":[
  {"metadata":{"name":"kube-apiserver-w1","namespace":"kube-system","uid":"u4",
    "ownerReferences":[{"kind":"Node","controller":true}]}},
  {"metadata":{"name":"helper","namespace":"default","uid":"u5",
-   "ownerReferences":[{"kind":"ReplicaSet","controller":false}]}}
+   "ownerReferences":[{"kind":"ReplicaSet","controller":false}]}},
+ {"metadata":{"name":"lmt-nodes-0","namespace":"monitoring","uid":"u6",
+   "ownerReferences":[{"kind":"StrimziPodSet","controller":true}]}},
+ {"metadata":{"name":"gigaorc-pg-1","namespace":"dev","uid":"u7",
+   "ownerReferences":[{"kind":"Cluster","apiVersion":"postgresql.cnpg.io/v1","controller":true}]}}
 ]}`
 
 func TestListNodePods(t *testing.T) {
@@ -64,6 +68,8 @@ func TestListNodePods(t *testing.T) {
 		"leaving":           {Namespace: "default", Name: "leaving", UID: "u3", Controlled: true, Terminating: true},
 		"kube-apiserver-w1": {Namespace: "kube-system", Name: "kube-apiserver-w1", UID: "u4"}, // mirror pod
 		"helper":            {Namespace: "default", Name: "helper", UID: "u5"},
+		"lmt-nodes-0":       {Namespace: "monitoring", Name: "lmt-nodes-0", UID: "u6", Controlled: true},
+		"gigaorc-pg-1":      {Namespace: "dev", Name: "gigaorc-pg-1", UID: "u7", Controlled: true},
 	}
 	if len(pods) != len(want) {
 		t.Fatalf("got %d pods, want %d", len(pods), len(want))

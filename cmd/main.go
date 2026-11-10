@@ -187,5 +187,17 @@ func loadEnvConfig(config *driver.DriverConfig) error {
 	}
 	config.MountHeal.KubeletDir = os.Getenv("TRUENAS_KUBELET_DIR")
 
+	// Optional: how long iSCSI I/O stays queued through a lost connection.
+	if val := os.Getenv("TRUENAS_ISCSI_REPLACEMENT_TIMEOUT"); val != "" {
+		timeout, err := time.ParseDuration(val)
+		if err != nil {
+			return fmt.Errorf("TRUENAS_ISCSI_REPLACEMENT_TIMEOUT: %w", err)
+		}
+		if timeout < time.Second {
+			return fmt.Errorf("TRUENAS_ISCSI_REPLACEMENT_TIMEOUT: %s is below one second", timeout)
+		}
+		config.ISCSIReplacementTimeout = timeout
+	}
+
 	return nil
 }

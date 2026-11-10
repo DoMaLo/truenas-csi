@@ -488,6 +488,10 @@ spec:
                   name: truenas-csi-config
                   key: nodeMetricsAddr
                   optional: true
+            # How long iSCSI I/O stays queued through a lost connection before
+            # the filesystem sees errors. Unset keeps the host's open-iscsi value.
+            # - name: TRUENAS_ISCSI_REPLACEMENT_TIMEOUT
+            #   value: "5m"
             # Mount healer, off by default. Uncomment to restart pods whose block
             # volume died in a storage outage, and add "delete" to the pods rule
             # of truenas-csi-node-role. See docs/mount-heal.md.

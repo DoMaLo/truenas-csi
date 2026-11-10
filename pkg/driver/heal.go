@@ -20,7 +20,6 @@ import (
 const (
 	defaultMountHealCooldown = 10 * time.Minute
 	defaultKubeletDir        = "/var/lib/kubelet"
-	defaultISCSIPort         = "3260"
 	portalDialTimeout        = 2 * time.Second
 
 	// softFailThreshold is how many scans in a row a volume must fail by not
@@ -47,9 +46,6 @@ const (
 	healActionConsumerNotFound  = "consumer_not_found"
 	healActionGaveUp            = "gave_up"
 )
-
-// sysfsRoot is overridable in tests.
-var sysfsRoot = "/sys"
 
 var iscsiSessionInPath = regexp.MustCompile(`/session(\d+)/`)
 
@@ -165,6 +161,16 @@ func (h *mountHealer) scan(ctx context.Context) {
 	var podsOnNode []healPod
 	podsLoaded := false
 	seen := map[string]bool{}
+	reachable := map[string]bool{}
+	anyReachable := func(portals []string) bool {
+		return slices.ContainsFunc(portals, func(p string) bool {
+			if ok, known := reachable[p]; known {
+				return ok
+			}
+			reachable[p] = h.portalReachable(p)
+			return reachable[p]
+		})
+	}
 
 	for _, staged := range h.stagedMounts(infos) {
 		path := staged.info.MountPoint
@@ -172,6 +178,17 @@ func (h *mountHealer) scan(ctx context.Context) {
 
 		st := h.state[path]
 		if st != nil && !st.lastRestart.IsZero() && h.now().Sub(st.lastRestart) < h.cfg.Cooldown {
+			continue
+		}
+
+		// While storage is unreachable there is nothing to do: restarting pods
+		// would only trade I/O errors for a stage that cannot complete. The mount
+		// is not even probed then, as a read would sit in the kernel until the
+		// session's replacement timeout, holding the mount busy.
+		if portals := h.portalsFor(staged.info); len(portals) > 0 && !anyReachable(portals) {
+			h.record(healActionPortalUnreachable)
+			log.V(LogLevelInfo).Info("Storage for a staged volume is unreachable, waiting",
+				"stagingPath", path, "portals", portals)
 			continue
 		}
 
@@ -209,15 +226,6 @@ func (h *mountHealer) scan(ctx context.Context) {
 					"the filesystem may need repair",
 					"stagingPath", path, "reason", reason, "restarts", st.restarts)
 			}
-			continue
-		}
-
-		// Restarting pods while storage is still unreachable only moves the
-		// failure from I/O errors to a stage that cannot complete.
-		if portals := h.portalsFor(staged.info); len(portals) > 0 && !h.anyReachable(portals) {
-			h.record(healActionPortalUnreachable)
-			log.V(LogLevelInfo).Info("Staged volume is unusable but storage is still unreachable, waiting",
-				"stagingPath", path, "reason", reason, "portals", portals)
 			continue
 		}
 
@@ -361,12 +369,12 @@ func (h *mountHealer) portalsFor(info mount.MountInfo) []string {
 	if portals := iscsiPortalsForDevice(filepath.Base(info.Source)); len(portals) > 0 {
 		out := make([]string, len(portals))
 		for i, p := range portals {
-			out[i] = withDefaultPort(p, defaultISCSIPort)
+			out[i] = withDefaultPort(p, iscsiDefaultPort)
 		}
 		return out
 	}
 	if p := h.node.driver.iscsiPortal; p != "" {
-		return []string{withDefaultPort(p, defaultISCSIPort)}
+		return []string{withDefaultPort(p, iscsiDefaultPort)}
 	}
 	return nil
 }
@@ -427,10 +435,6 @@ func iscsiPortalsForDevice(devName string) []string {
 		}
 	}
 	return nil
-}
-
-func (h *mountHealer) anyReachable(portals []string) bool {
-	return slices.ContainsFunc(portals, h.portalReachable)
 }
 
 // dialPortal reports whether a host:port accepts a TCP connection.

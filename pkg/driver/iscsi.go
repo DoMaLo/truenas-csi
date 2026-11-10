@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	iscsilib "github.com/kubernetes-csi/csi-lib-iscsi/iscsi"
@@ -58,6 +59,11 @@ type ISCSIHandler struct {
 	mounter *mount.SafeFormatAndMount
 	resizer *mount.ResizeFs
 	log     logr.Logger
+
+	// replacementTimeout, when set, is how long the kernel keeps I/O queued for a
+	// session whose connection dropped before failing it. Zero leaves the host's
+	// setting (open-iscsi defaults to 120s).
+	replacementTimeout time.Duration
 }
 
 // ISCSIConfig holds iSCSI-specific configuration parsed from volume/publish contexts
@@ -281,19 +287,18 @@ func (h *ISCSIHandler) Stage(ctx context.Context, req *StageRequest) (*StageResu
 func (h *ISCSIHandler) Unstage(ctx context.Context, req *UnstageRequest) error {
 	h.log.V(LogLevelDebug).Info("iSCSI Unstage", "volumeId", req.VolumeID, "stagingPath", req.StagingPath)
 
-	// Check if mounted
-	notMounted, err := h.mounter.IsLikelyNotMountPoint(req.StagingPath)
+	// A staging mount that died in a storage outage cannot even be stat'ed; it is
+	// unmounted all the same, or the volume could never be released.
+	mounted, corruptErr, err := checkMountPoint(h.mounter, req.StagingPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			h.log.V(LogLevelDebug).Info("Staging path does not exist, considering unstaged", "stagingPath", req.StagingPath)
-			// Still try to disconnect iSCSI and cleanup connector
-			return h.cleanupISCSISession(req.VolumeID)
-		}
 		return fmt.Errorf("failed to check mount point: %w", err)
+	}
+	if corruptErr != nil {
+		h.log.Info("Staging mount cannot be read, unmounting it anyway", "stagingPath", req.StagingPath, "error", corruptErr.Error())
 	}
 
 	// Unmount if mounted
-	if !notMounted {
+	if mounted {
 		if err := h.mounter.Unmount(req.StagingPath); err != nil {
 			return fmt.Errorf("failed to unmount staging path: %w", err)
 		}
@@ -421,9 +426,14 @@ func (h *ISCSIHandler) Publish(ctx context.Context, req *PublishRequest) error {
 	// Verify staging path is mounted and still usable. After a network outage the
 	// mount point can remain while the filesystem is read-only or returns EIO;
 	// bind-mounting that into the pod silently hands the workload a dead volume.
-	notMounted, err := h.mounter.IsLikelyNotMountPoint(req.StagingPath)
-	if err != nil || notMounted {
+	mounted, corruptErr, err := checkMountPoint(h.mounter, req.StagingPath)
+	switch {
+	case err != nil:
+		return fmt.Errorf("failed to check staging path %s: %w", req.StagingPath, err)
+	case !mounted:
 		return fmt.Errorf("volume not staged at %s", req.StagingPath)
+	case corruptErr != nil:
+		return fmt.Errorf("volume staged at %s is unusable: staging mount cannot be read: %w", req.StagingPath, corruptErr)
 	}
 	if reason := unusableStagedMountReason(req.StagingPath, readOnlyRequested(req.VolumeCapability)); reason != "" {
 		return fmt.Errorf("volume staged at %s is unusable: %s", req.StagingPath, reason)
@@ -510,15 +520,12 @@ func (h *ISCSIHandler) publishBlockVolume(ctx context.Context, req *PublishReque
 func (h *ISCSIHandler) Unpublish(ctx context.Context, req *UnpublishRequest) error {
 	h.log.V(LogLevelDebug).Info("iSCSI Unpublish", "volumeId", req.VolumeID, "targetPath", req.TargetPath)
 
-	notMounted, err := h.mounter.IsLikelyNotMountPoint(req.TargetPath)
+	mounted, _, err := checkMountPoint(h.mounter, req.TargetPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
 		return fmt.Errorf("failed to check mount point: %w", err)
 	}
 
-	if notMounted {
+	if !mounted {
 		return nil
 	}
 
