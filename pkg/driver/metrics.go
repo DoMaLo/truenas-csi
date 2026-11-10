@@ -117,7 +117,7 @@ func NewMetrics() *Metrics {
 		mountHeal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "mount_heal_actions_total",
-			Help:      "What the node mount healer found and did, by action: unusable_mount, portal_unreachable, no_consumers, pod_deleted, pod_skipped_unmanaged, pod_delete_failed.",
+			Help:      "What the node mount healer found and did, by action: unusable_mount, portal_unreachable, no_consumers, pod_deleted, pod_skipped_unmanaged, pod_delete_failed, list_pods_failed, consumer_not_found, gave_up.",
 		}, []string{"action"}),
 	}
 

@@ -194,17 +194,36 @@ func readOnlyRequested(capability *csi.VolumeCapability) bool {
 // bind-mounted onto it keeps failing. Such a mount is re-staged instead of being
 // reused.
 func unusableStagedMountReason(path string, readOnly bool) string {
+	reason, _ := stagedMountVerdict(path, readOnly)
+	return reason
+}
+
+// isBlockProtocol reports whether the publish context names a block protocol, the
+// ones whose mounts the driver can tell apart from a slow one.
+func isBlockProtocol(publishContext map[string]string) bool {
+	switch publishContext[PublishContextProtocol] {
+	case ProtocolISCSI, ProtocolNVMeOF:
+		return true
+	}
+	return false
+}
+
+// stagedMountVerdict is unusableStagedMountReason that also says whether the
+// verdict rests on a probe that merely ran out of time. A slow answer is weaker
+// evidence than an I/O error: a volume under heavy load can be slow without being
+// dead, so callers that act on it repeatedly want to see it more than once.
+func stagedMountVerdict(path string, readOnly bool) (reason string, soft bool) {
 	var stat syscall.Statfs_t
 	if err := statfs(path, &stat); err != nil {
-		return fmt.Sprintf("staged filesystem is not responding: %v", err)
+		return fmt.Sprintf("staged filesystem is not responding: %v", err), false
 	}
 	if !readOnly && stat.Flags&statfsFlagReadOnly != 0 {
-		return "staged filesystem is mounted read-only but read-write access was requested"
+		return "staged filesystem is mounted read-only but read-write access was requested", false
 	}
 	if err := probeMount(path); isDeadMountError(err) {
-		return fmt.Sprintf("staged filesystem failed a read probe: %v", err)
+		return fmt.Sprintf("staged filesystem failed a read probe: %v", err), isSlowProbeError(err)
 	}
-	return ""
+	return "", false
 }
 
 // validateVolumeCapability checks if the requested capability is supported
@@ -386,6 +405,7 @@ func (s *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	isBlockVolume := req.VolumeCapability.GetBlock() != nil
 
 	// Check if already mounted/published (idempotency)
+	mountedBlockTarget := false
 	if isBlockVolume {
 		// For block volumes, check if target path exists and is a device
 		if _, err := os.Stat(req.TargetPath); err == nil {
@@ -398,18 +418,13 @@ func (s *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 			return nil, status.Errorf(codes.Internal, "failed to check mount point: %v", err)
 		}
 		if !notMounted {
-			// A bind that survived a storage outage can look mounted while returning
-			// EIO/EROFS. Tear it down so Publish remounts from a healthy staging path.
-			if reason := unusableStagedMountReason(req.TargetPath, req.Readonly || readOnlyRequested(req.VolumeCapability)); reason != "" {
-				s.driver.Log().Info("Existing publish mount is unusable, publishing again",
-					"volumeId", req.VolumeId, "targetPath", req.TargetPath, "reason", reason)
-				if err := s.mounter.Unmount(req.TargetPath); err != nil {
-					return nil, status.Errorf(codes.Internal, "failed to release the unusable publish mount: %v", err)
-				}
-			} else {
+			if !isBlockProtocol(req.PublishContext) {
 				s.driver.Log().V(LogLevelDebug).Info("Volume already mounted", "volumeId", req.VolumeId, "targetPath", req.TargetPath)
 				return &csi.NodePublishVolumeResponse{}, nil
 			}
+			// A bind that survived a storage outage can look mounted while
+			// returning EIO. Whether it did is decided under the lock below.
+			mountedBlockTarget = true
 		}
 	}
 
@@ -419,6 +434,23 @@ func (s *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 		return nil, status.Errorf(codes.Aborted, "operation already in progress for volume %s", req.VolumeId)
 	}
 	defer s.ReleaseLock(lockKey)
+
+	if mountedBlockTarget {
+		// Only block volumes get here: a probe of an NFS mount whose server is away
+		// would hang, and tearing that mount down helps nobody.
+		if notMounted, err := s.mounter.IsLikelyNotMountPoint(req.TargetPath); err == nil && !notMounted {
+			reason := unusableStagedMountReason(req.TargetPath, req.Readonly || readOnlyRequested(req.VolumeCapability))
+			if reason == "" {
+				s.driver.Log().V(LogLevelDebug).Info("Volume already mounted", "volumeId", req.VolumeId, "targetPath", req.TargetPath)
+				return &csi.NodePublishVolumeResponse{}, nil
+			}
+			s.driver.Log().Info("Existing publish mount is unusable, publishing again",
+				"volumeId", req.VolumeId, "targetPath", req.TargetPath, "reason", reason)
+			if err := s.mounter.Unmount(req.TargetPath); err != nil {
+				return nil, status.Errorf(codes.Internal, "failed to release the unusable publish mount: %v", err)
+			}
+		}
+	}
 
 	// Get appropriate handler
 	handler, err := s.getHandler(req.PublishContext)

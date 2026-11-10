@@ -25,19 +25,25 @@ Opt-in, the mount healer in the node plugin. Every interval it:
 1. Reads the node's mount table and picks this driver's block staging mounts.
 2. Checks each one: `statfs`, the read-only flag when the volume was not
    mounted read-only on request, and a directory read bounded by a 5 second
-   timeout. A probe that is still hanging from an earlier round counts as a
-   failure, and no second probe is started on the same mount.
-3. Skips the volume while none of its portals accept a TCP connection, since
+   timeout. A probe still hanging from an earlier round counts as a failure,
+   and no second probe is started on the same mount.
+3. Acts on an I/O error at once, but on a probe that only ran out of time just
+   after 3 scans in a row, because a heavily loaded volume can be slow without
+   being dead.
+4. Skips the volume while none of its portals accept a TCP connection, since
    restarting pods then would only trade I/O errors for a failing stage. The
-   portals come from the iSCSI connector file, or the driver's configured
-   iSCSI or NVMe-oF portal.
-4. Deletes the pods on this node that use the volume, so kubelet unpublishes
+   portals come from the iSCSI connector file of the session behind the device
+   (matched by target IQN), or the driver's configured iSCSI or NVMe-oF portal.
+5. Deletes the pods on this node that use the volume, so kubelet unpublishes
    and unstages it and the next `NodeStageVolume` mounts it fresh. Only pods
-   with a controller (Deployment, StatefulSet, Job, ...) are deleted, with a UID
-   precondition. A pod without a controller is left alone and logged, since
-   nothing would recreate it.
-5. Leaves the volume alone for the cooldown period, so kubelet has time to
-   restage it before the next attempt.
+   owned by a ReplicaSet, StatefulSet, DaemonSet, Job or ReplicationController
+   are deleted, with a UID precondition. Any other pod, including the mirror pod
+   of a static pod, is left alone and logged, since deleting it would not bring
+   the workload back.
+6. Leaves the volume alone for the cooldown period, so kubelet has time to
+   restage it before the next attempt. If the volume is still dead after 3 rounds
+   of restarts, the healer stops touching it and logs an error: that points at a
+   damaged filesystem, which restarting pods does not repair.
 
 The healer never mounts, unmounts, or logs out of sessions itself; that stays
 with the regular CSI calls.
@@ -78,10 +84,21 @@ when node metrics are enabled:
 | `pod_deleted` | A pod was deleted so its volume is staged again |
 | `pod_skipped_unmanaged` | A pod without a controller uses a dead volume and needs a manual restart |
 | `pod_delete_failed` | The API refused or failed the deletion |
+| `list_pods_failed` | The pods on the node could not be listed, for example because the role lacks permission |
+| `consumer_not_found` | A pod mounting the volume is not among the node's pods; check that the node ID is the Kubernetes node name |
+| `gave_up` | The volume stayed dead after the maximum rounds of restarts and needs repair |
 
 ## Limits
 
 - Pods are restarted, which is the disruption the outage already caused; the
   healer only shortens it.
+- Pods are deleted, not evicted, so PodDisruptionBudgets do not hold the healer
+  back. The pods are already failing, and a budget that blocked their restart
+  would keep the outage going.
+- The node plugin's ClusterRole is shared by every node, so with the healer
+  enabled each node plugin can delete pods in any namespace. The plugin already
+  runs privileged on the host; weigh that before enabling it.
 - Short blips are better handled on the host by the open-iscsi
   `replacement_timeout`, which keeps I/O queued instead of failing it.
+- Publish checks an existing block publish mount the same way, but never an NFS
+  one.

@@ -16,18 +16,29 @@ import (
 	"time"
 )
 
-const (
-	serviceAccountDir     = "/var/run/secrets/kubernetes.io/serviceaccount"
-	kubeAPIRequestTimeout = 15 * time.Second
-)
+const kubeAPIRequestTimeout = 15 * time.Second
+
+// serviceAccountDir is overridable in tests.
+var serviceAccountDir = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+// restartingOwnerKinds are the controllers known to recreate a pod that is
+// deleted. Other owners are not trusted to: a mirror pod of a static pod is owned
+// by its Node as a controller, and deleting it restarts nothing.
+var restartingOwnerKinds = map[string]bool{
+	"ReplicaSet":            true,
+	"StatefulSet":           true,
+	"DaemonSet":             true,
+	"Job":                   true,
+	"ReplicationController": true,
+}
 
 // healPod is the part of a pod the mount healer needs.
 type healPod struct {
 	Namespace string
 	Name      string
 	UID       string
-	// Controlled is set when a controller (StatefulSet, ReplicaSet, ...) owns the
-	// pod and will recreate it once deleted.
+	// Controlled is set when a workload controller (StatefulSet, ReplicaSet, ...)
+	// owns the pod and will recreate it once deleted.
 	Controlled bool
 	// Terminating is set once the pod has a deletion timestamp.
 	Terminating bool
@@ -98,7 +109,8 @@ type podListResponse struct {
 			UID               string  `json:"uid"`
 			DeletionTimestamp *string `json:"deletionTimestamp"`
 			OwnerReferences   []struct {
-				Controller *bool `json:"controller"`
+				Kind       string `json:"kind"`
+				Controller *bool  `json:"controller"`
 			} `json:"ownerReferences"`
 		} `json:"metadata"`
 	} `json:"items"`
@@ -129,7 +141,7 @@ func (a *inClusterPodAPI) ListNodePods(ctx context.Context, nodeName string) ([]
 			Terminating: item.Metadata.DeletionTimestamp != nil,
 		}
 		for _, ref := range item.Metadata.OwnerReferences {
-			if ref.Controller != nil && *ref.Controller {
+			if ref.Controller != nil && *ref.Controller && restartingOwnerKinds[ref.Kind] {
 				pod.Controlled = true
 			}
 		}

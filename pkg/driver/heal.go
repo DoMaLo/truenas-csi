@@ -6,11 +6,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	iscsilib "github.com/kubernetes-csi/csi-lib-iscsi/iscsi"
+	"github.com/truenas/truenas-csi/pkg/client"
 	"k8s.io/mount-utils"
 )
 
@@ -19,6 +22,16 @@ const (
 	defaultKubeletDir        = "/var/lib/kubelet"
 	defaultISCSIPort         = "3260"
 	portalDialTimeout        = 2 * time.Second
+
+	// softFailThreshold is how many scans in a row a volume must fail by not
+	// answering in time before it is acted on. A volume under heavy load can be
+	// slow without being dead; one that returns I/O errors is acted on at once.
+	softFailThreshold = 3
+
+	// maxHealRestarts bounds the rounds of pod restarts for a volume that stays
+	// dead afterwards. That points at a damaged filesystem rather than the network,
+	// which restarting the same pods again will not fix.
+	maxHealRestarts = 3
 )
 
 // Mount healer outcomes, used as the metric label. A fixed set keeps cardinality
@@ -30,7 +43,15 @@ const (
 	healActionPodDeleted        = "pod_deleted"
 	healActionSkippedUnmanaged  = "pod_skipped_unmanaged"
 	healActionDeleteFailed      = "pod_delete_failed"
+	healActionListFailed        = "list_pods_failed"
+	healActionConsumerNotFound  = "consumer_not_found"
+	healActionGaveUp            = "gave_up"
 )
+
+// sysfsRoot is overridable in tests.
+var sysfsRoot = "/sys"
+
+var iscsiSessionInPath = regexp.MustCompile(`/session(\d+)/`)
 
 // MountHealConfig configures the node plugin's mount healer.
 type MountHealConfig struct {
@@ -61,11 +82,20 @@ type mountHealer struct {
 	cfg         MountHealConfig
 	stagingRoot string
 	podsRoot    string
-	lastAction  map[string]time.Time
+	state       map[string]*healState // by staging path
 
 	listMounts      func() ([]mount.MountInfo, error)
 	portalReachable func(portal string) bool
 	now             func() time.Time
+}
+
+// healState is what the healer remembers about one staged volume while it is
+// unhealthy. It is dropped as soon as the volume checks out, or goes away.
+type healState struct {
+	softFails   int       // consecutive scans that failed by timeout only
+	restarts    int       // rounds of pod restarts so far
+	lastRestart time.Time // start of the cooldown
+	gaveUp      bool
 }
 
 func newMountHealer(node *NodeServer, cfg MountHealConfig) (*mountHealer, error) {
@@ -90,7 +120,7 @@ func newMountHealerWithAPI(node *NodeServer, cfg MountHealConfig, pods podAPI) *
 		cfg:         cfg,
 		stagingRoot: filepath.Join(kubeletDir, "plugins", "kubernetes.io", "csi", node.driver.name),
 		podsRoot:    filepath.Join(kubeletDir, "pods"),
-		lastAction:  map[string]time.Time{},
+		state:       map[string]*healState{},
 		listMounts: func() ([]mount.MountInfo, error) {
 			return mount.ParseMountInfo("/proc/self/mountinfo")
 		},
@@ -134,10 +164,14 @@ func (h *mountHealer) scan(ctx context.Context) {
 
 	var podsOnNode []healPod
 	podsLoaded := false
+	seen := map[string]bool{}
 
 	for _, staged := range h.stagedMounts(infos) {
 		path := staged.info.MountPoint
-		if last, ok := h.lastAction[path]; ok && h.now().Sub(last) < h.cfg.Cooldown {
+		seen[path] = true
+
+		st := h.state[path]
+		if st != nil && !st.lastRestart.IsZero() && h.now().Sub(st.lastRestart) < h.cfg.Cooldown {
 			continue
 		}
 
@@ -145,12 +179,38 @@ func (h *mountHealer) scan(ctx context.Context) {
 		// options. One the kernel turned read-only after an I/O error keeps "rw"
 		// there and only its superblock is read-only, which statfs then reports.
 		readOnly := slices.Contains(staged.info.MountOptions, mountOptionReadOnly)
-		reason := unusableStagedMountReason(path, readOnly)
+		reason, soft := stagedMountVerdict(path, readOnly)
 		if reason == "" {
-			delete(h.lastAction, path)
+			delete(h.state, path)
 			continue
 		}
 		h.record(healActionUnusable)
+		if st == nil {
+			st = &healState{}
+			h.state[path] = st
+		}
+
+		if soft {
+			st.softFails++
+			if st.softFails < softFailThreshold {
+				log.V(LogLevelInfo).Info("Staged volume did not answer in time, checking again next scan",
+					"stagingPath", path, "reason", reason, "consecutive", st.softFails, "threshold", softFailThreshold)
+				continue
+			}
+		} else {
+			st.softFails = 0
+		}
+
+		if st.restarts >= maxHealRestarts {
+			if !st.gaveUp {
+				st.gaveUp = true
+				h.record(healActionGaveUp)
+				log.Error(nil, "Staged volume is still unusable after restarting its pods, leaving it alone; "+
+					"the filesystem may need repair",
+					"stagingPath", path, "reason", reason, "restarts", st.restarts)
+			}
+			continue
+		}
 
 		// Restarting pods while storage is still unreachable only moves the
 		// failure from I/O errors to a stage that cannot complete.
@@ -165,13 +225,14 @@ func (h *mountHealer) scan(ctx context.Context) {
 			h.record(healActionNoConsumers)
 			log.Info("Staged volume is unusable and no pod on this node uses it; kubelet unstages it",
 				"stagingPath", path, "reason", reason)
-			h.lastAction[path] = h.now()
+			st.lastRestart = h.now()
 			continue
 		}
 
 		if !podsLoaded {
 			podsOnNode, err = h.pods.ListNodePods(ctx, h.node.driver.NodeID())
 			if err != nil {
+				h.record(healActionListFailed)
 				log.Error(err, "Mount healer could not list the pods on this node")
 				return
 			}
@@ -180,23 +241,33 @@ func (h *mountHealer) scan(ctx context.Context) {
 
 		log.Info("Staged volume is unusable, restarting the pods that use it",
 			"stagingPath", path, "reason", reason, "pods", len(staged.consumerPods))
-		h.restartConsumers(ctx, path, staged.consumerPods, podsOnNode)
-		h.lastAction[path] = h.now()
+		if h.restartConsumers(ctx, path, staged.consumerPods, podsOnNode) > 0 {
+			st.restarts++
+		}
+		st.lastRestart = h.now()
 	}
 
-	for path, last := range h.lastAction {
-		if h.now().Sub(last) >= h.cfg.Cooldown {
-			delete(h.lastAction, path)
+	// A volume that is no longer staged is being handled by kubelet already.
+	for path := range h.state {
+		if !seen[path] {
+			delete(h.state, path)
 		}
 	}
 }
 
-func (h *mountHealer) restartConsumers(ctx context.Context, stagingPath string, uids []string, podsOnNode []healPod) {
+// restartConsumers deletes the controller-owned pods among uids and returns how
+// many deletions it issued.
+func (h *mountHealer) restartConsumers(ctx context.Context, stagingPath string, uids []string, podsOnNode []healPod) int {
 	log := h.node.driver.Log()
+	deleted := 0
 	for _, uid := range uids {
 		idx := slices.IndexFunc(podsOnNode, func(p healPod) bool { return p.UID == uid })
 		if idx < 0 {
-			// The pod is gone and kubelet is tearing its volume down already.
+			// Usually a pod that is already gone, whose volume kubelet is tearing
+			// down. It also happens when the node ID is not the Kubernetes node name.
+			h.record(healActionConsumerNotFound)
+			log.Info("Pod using an unusable volume is not among the pods of this node",
+				"podUID", uid, "nodeID", h.node.driver.NodeID(), "stagingPath", stagingPath)
 			continue
 		}
 		pod := podsOnNode[idx]
@@ -206,7 +277,7 @@ func (h *mountHealer) restartConsumers(ctx context.Context, stagingPath string, 
 		case !pod.Controlled:
 			// Nothing would recreate it, so deleting it would lose the workload.
 			h.record(healActionSkippedUnmanaged)
-			log.Info("Pod uses an unusable volume but has no controller to recreate it, restart it manually",
+			log.Info("Pod uses an unusable volume but no workload controller will recreate it, restart it manually",
 				"pod", pod.Namespace+"/"+pod.Name, "stagingPath", stagingPath)
 		default:
 			if err := h.pods.DeletePod(ctx, pod); err != nil {
@@ -214,11 +285,13 @@ func (h *mountHealer) restartConsumers(ctx context.Context, stagingPath string, 
 				log.Error(err, "Mount healer could not delete pod", "pod", pod.Namespace+"/"+pod.Name)
 				continue
 			}
+			deleted++
 			h.record(healActionPodDeleted)
 			log.Info("Mount healer deleted pod so its volume is staged again",
 				"pod", pod.Namespace+"/"+pod.Name, "stagingPath", stagingPath)
 		}
 	}
+	return deleted
 }
 
 // stagedMounts returns this driver's filesystem staging mounts and, for each, the
@@ -275,23 +348,53 @@ func (h *mountHealer) podUIDFromVolumePath(path string) string {
 	return parts[0]
 }
 
-// portalsFor returns the storage portals a staged volume depends on: the ones in
-// its iSCSI connector file when one matches its device, else the driver's
-// configured portals for the device's protocol.
+// portalsFor returns the storage portals a staged volume depends on, each with a
+// port: the ones in its iSCSI connector file when one matches its device, else the
+// driver's configured portal for the device's protocol.
 func (h *mountHealer) portalsFor(info mount.MountInfo) []string {
 	if strings.HasPrefix(info.Source, devicePrefixNVMe) {
 		if p := h.node.driver.nvmeofPortal; p != "" {
-			return []string{p}
+			return []string{withDefaultPort(p, strconv.Itoa(client.NVMeDefaultPort))}
 		}
 		return nil
 	}
 	if portals := iscsiPortalsForDevice(filepath.Base(info.Source)); len(portals) > 0 {
-		return portals
+		out := make([]string, len(portals))
+		for i, p := range portals {
+			out[i] = withDefaultPort(p, defaultISCSIPort)
+		}
+		return out
 	}
 	if p := h.node.driver.iscsiPortal; p != "" {
-		return []string{p}
+		return []string{withDefaultPort(p, defaultISCSIPort)}
 	}
 	return nil
+}
+
+func withDefaultPort(portal, port string) string {
+	if _, _, err := net.SplitHostPort(portal); err == nil {
+		return portal
+	}
+	return net.JoinHostPort(strings.Trim(portal, "[]"), port)
+}
+
+// iscsiTargetIQN returns the IQN of the session behind a block device, or "" when
+// sysfs does not say. Device names are reused across logins, so the name alone
+// can point at another volume's connector file.
+func iscsiTargetIQN(devName string) string {
+	resolved, err := filepath.EvalSymlinks(filepath.Join(sysfsRoot, "block", devName))
+	if err != nil {
+		return ""
+	}
+	m := iscsiSessionInPath.FindStringSubmatch(filepath.ToSlash(resolved))
+	if m == nil {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(sysfsRoot, "class", "iscsi_session", "session"+m[1], "targetname"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func iscsiPortalsForDevice(devName string) []string {
@@ -299,6 +402,7 @@ func iscsiPortalsForDevice(devName string) []string {
 	if err != nil {
 		return nil
 	}
+	iqn := iscsiTargetIQN(devName)
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".connector") {
 			continue
@@ -311,8 +415,13 @@ func iscsiPortalsForDevice(devName string) []string {
 		if err := json.Unmarshal(data, &c); err != nil {
 			continue
 		}
-		owns := c.MountTargetDevice != nil && c.MountTargetDevice.Name == devName
-		owns = owns || slices.ContainsFunc(c.Devices, func(d iscsilib.Device) bool { return d.Name == devName })
+		var owns bool
+		if iqn != "" {
+			owns = c.TargetIqn == iqn
+		} else {
+			owns = c.MountTargetDevice != nil && c.MountTargetDevice.Name == devName
+			owns = owns || slices.ContainsFunc(c.Devices, func(d iscsilib.Device) bool { return d.Name == devName })
+		}
 		if owns {
 			return c.TargetPortals
 		}
@@ -324,12 +433,9 @@ func (h *mountHealer) anyReachable(portals []string) bool {
 	return slices.ContainsFunc(portals, h.portalReachable)
 }
 
+// dialPortal reports whether a host:port accepts a TCP connection.
 func dialPortal(portal string) bool {
-	addr := portal
-	if _, _, err := net.SplitHostPort(portal); err != nil {
-		addr = net.JoinHostPort(portal, defaultISCSIPort)
-	}
-	conn, err := net.DialTimeout("tcp", addr, portalDialTimeout)
+	conn, err := net.DialTimeout("tcp", portal, portalDialTimeout)
 	if err != nil {
 		return false
 	}

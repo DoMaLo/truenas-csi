@@ -247,3 +247,164 @@ func TestPortalsFor_PrefersISCSIConnector(t *testing.T) {
 		t.Errorf("portalsFor(/dev/sdz) = %v, want the configured portal", got)
 	}
 }
+
+func TestPortalsFor_AddsDefaultPortPerProtocol(t *testing.T) {
+	f := newHealerFixture(t, nil)
+	f.healer.node.driver.iscsiPortal = "192.0.2.10"
+	f.healer.node.driver.nvmeofPortal = "192.0.2.10"
+
+	if got := f.healer.portalsFor(mount.MountInfo{Source: "/dev/sdz"}); !slices.Equal(got, []string{"192.0.2.10:3260"}) {
+		t.Errorf("iSCSI portal = %v, want port 3260", got)
+	}
+	if got := f.healer.portalsFor(mount.MountInfo{Source: "/dev/nvme0n1"}); !slices.Equal(got, []string{"192.0.2.10:4420"}) {
+		t.Errorf("NVMe-oF portal = %v, want port 4420", got)
+	}
+}
+
+func TestWithDefaultPort(t *testing.T) {
+	tests := map[string]string{
+		"192.0.2.10":      "192.0.2.10:3260",
+		"192.0.2.10:3261": "192.0.2.10:3261",
+		"fd00::1":         "[fd00::1]:3260",
+		"[fd00::1]:3260":  "[fd00::1]:3260",
+		"[fd00::1]":       "[fd00::1]:3260",
+	}
+	for in, want := range tests {
+		if got := withDefaultPort(in, "3260"); got != want {
+			t.Errorf("withDefaultPort(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A device name can belong to another volume's connector file after logins have
+// come and gone, so the session's IQN decides when sysfs knows it.
+func TestPortalsFor_MatchesConnectorByTargetIQN(t *testing.T) {
+	f := newHealerFixture(t, nil)
+
+	sys := t.TempDir()
+	orig := sysfsRoot
+	sysfsRoot = sys
+	t.Cleanup(func() { sysfsRoot = orig })
+	devDir := filepath.Join(sys, "devices", "platform", "host3", "session7", "target3:0:0", "3:0:0:0", "block", "sdb")
+	sessionDir := filepath.Join(sys, "class", "iscsi_session", "session7")
+	for _, dir := range []string{devDir, sessionDir, filepath.Join(sys, "block")} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(devDir, filepath.Join(sys, "block", "sdb")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionDir, "targetname"), []byte("iqn.test:current\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	write := func(name, iqn, portal string) {
+		data, err := json.Marshal(iscsilib.Connector{
+			VolumeName:        name,
+			TargetIqn:         iqn,
+			TargetPortals:     []string{portal},
+			MountTargetDevice: &iscsilib.Device{Name: "sdb"}, // stale: the name was reused
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(connectorDir, sanitizeISCSIVolumeID(name)+".connector"), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("a-old", "iqn.test:old", "198.51.100.1:3260")
+	write("b-current", "iqn.test:current", "198.51.100.2:3260")
+
+	if got := f.healer.portalsFor(mount.MountInfo{Source: "/dev/sdb"}); !slices.Equal(got, []string{"198.51.100.2:3260"}) {
+		t.Errorf("portalsFor(/dev/sdb) = %v, want the portal of the connector with the session's IQN", got)
+	}
+}
+
+func TestScan_SlowProbeNeedsRepeatedFailures(t *testing.T) {
+	stubStatfs(t, 0, nil)
+	stubMountProbe(t, errProbeTimeout)
+	f := newHealerFixture(t, stagedWithConsumer("/dev/sdb"), controlledPod("loki-0"))
+
+	for i := 1; i < softFailThreshold; i++ {
+		f.healer.scan(context.Background())
+		if len(f.pods.deleted) != 0 {
+			t.Fatalf("scan %d: a volume that is merely slow must not lose its pods yet, deleted = %v", i, f.pods.deleted)
+		}
+	}
+	f.healer.scan(context.Background())
+	if len(f.pods.deleted) != 1 {
+		t.Errorf("a volume that never answers must be healed after %d scans, deleted = %v", softFailThreshold, f.pods.deleted)
+	}
+}
+
+func TestScan_RecoveredVolumeResetsSlowCount(t *testing.T) {
+	stubStatfs(t, 0, nil)
+	f := newHealerFixture(t, stagedWithConsumer("/dev/sdb"), controlledPod("loki-0"))
+
+	for i := 0; i < softFailThreshold-1; i++ {
+		stubMountProbe(t, errProbeTimeout)
+		f.healer.scan(context.Background())
+	}
+	stubMountProbe(t, nil)
+	f.healer.scan(context.Background())
+	stubMountProbe(t, errProbeTimeout)
+	f.healer.scan(context.Background())
+
+	if len(f.pods.deleted) != 0 {
+		t.Errorf("slow scans separated by a healthy one must not add up, deleted = %v", f.pods.deleted)
+	}
+}
+
+func TestScan_IOErrorActsImmediately(t *testing.T) {
+	stubStatfs(t, 0, nil)
+	stubMountProbe(t, syscall.EIO)
+	f := newHealerFixture(t, stagedWithConsumer("/dev/sdb"), controlledPod("loki-0"))
+
+	f.healer.scan(context.Background())
+	if len(f.pods.deleted) != 1 {
+		t.Errorf("an I/O error is conclusive, deleted = %v", f.pods.deleted)
+	}
+}
+
+func TestScan_GivesUpOnVolumeThatStaysDead(t *testing.T) {
+	stubStatfs(t, 0, nil)
+	stubMountProbe(t, syscall.EIO)
+	f := newHealerFixture(t, stagedWithConsumer("/dev/sdb"), controlledPod("loki-0"))
+
+	for i := 0; i < maxHealRestarts+3; i++ {
+		f.now = f.now.Add(defaultMountHealCooldown)
+		f.healer.scan(context.Background())
+	}
+	if len(f.pods.deleted) != maxHealRestarts {
+		t.Errorf("deleted %d times, want it capped at %d", len(f.pods.deleted), maxHealRestarts)
+	}
+}
+
+func TestScan_VolumeThatIsGoneIsForgotten(t *testing.T) {
+	stubStatfs(t, 0, nil)
+	stubMountProbe(t, syscall.EIO)
+	infos := stagedWithConsumer("/dev/sdb")
+	f := newHealerFixture(t, infos, controlledPod("loki-0"))
+
+	f.healer.scan(context.Background())
+	if len(f.healer.state) != 1 {
+		t.Fatalf("state = %v, want one entry", f.healer.state)
+	}
+	f.healer.listMounts = func() ([]mount.MountInfo, error) { return nil, nil }
+	f.healer.scan(context.Background())
+	if len(f.healer.state) != 0 {
+		t.Errorf("state = %v, want it dropped once the volume is unstaged", f.healer.state)
+	}
+}
+
+func TestScan_ConsumerMissingFromNodePods(t *testing.T) {
+	stubStatfs(t, 0, nil)
+	stubMountProbe(t, syscall.EIO)
+	f := newHealerFixture(t, stagedWithConsumer("/dev/sdb"), healPod{Namespace: "x", Name: "other", UID: "different", Controlled: true})
+
+	f.healer.scan(context.Background())
+	if len(f.pods.deleted) != 0 {
+		t.Errorf("deleted = %v, want none", f.pods.deleted)
+	}
+}

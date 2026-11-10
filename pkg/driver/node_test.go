@@ -451,3 +451,80 @@ func TestPluginCapabilities_ExcludeAccessibilityConstraints(t *testing.T) {
 		}
 	}
 }
+
+func publishRequest(protocol, staging, target string) *csi.NodePublishVolumeRequest {
+	return &csi.NodePublishVolumeRequest{
+		VolumeId:          "tank/pvc-abc",
+		StagingTargetPath: staging,
+		TargetPath:        target,
+		PublishContext:    map[string]string{PublishContextProtocol: protocol},
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{FsType: DefaultFSType},
+			},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		},
+	}
+}
+
+func unmounted(fake *mount.FakeMounter, target string) bool {
+	for _, action := range fake.GetLog() {
+		if action.Action == mount.FakeActionUnmount && action.Target == target {
+			return true
+		}
+	}
+	return false
+}
+
+// A bind mount that outlived a storage outage is released so Publish can mount it
+// again from a healthy staging path.
+func TestNodePublishVolume_ReplacesDeadBlockTarget(t *testing.T) {
+	useTempConnectorDir(t)
+	target := stagingDir(t)
+	stubStatfs(t, 0, nil)
+	stubMountProbe(t, syscall.EIO)
+
+	ns, fake := newTestNodeServer(t, []mount.MountPoint{{Device: "/dev/sda", Path: target, Type: "xfs"}})
+
+	// Publish itself cannot finish here because nothing is staged; what matters is
+	// that the request did not report the dead mount as published.
+	if _, err := ns.NodePublishVolume(context.Background(), publishRequest(ProtocolISCSI, "/not/staged", target)); err == nil {
+		t.Fatal("NodePublishVolume() reported a dead mount as published")
+	}
+	if !unmounted(fake, target) {
+		t.Errorf("the dead publish mount was not released, actions: %v", fake.GetLog())
+	}
+}
+
+func TestNodePublishVolume_LeavesHealthyBlockTarget(t *testing.T) {
+	useTempConnectorDir(t)
+	target := stagingDir(t)
+	stubStatfs(t, 0, nil)
+	stubMountProbe(t, nil)
+
+	ns, fake := newTestNodeServer(t, []mount.MountPoint{{Device: "/dev/sda", Path: target, Type: "xfs"}})
+
+	if _, err := ns.NodePublishVolume(context.Background(), publishRequest(ProtocolISCSI, "/not/staged", target)); err != nil {
+		t.Fatalf("NodePublishVolume() on a healthy mount = %v, want nil", err)
+	}
+	if unmounted(fake, target) {
+		t.Errorf("a healthy publish mount must be left alone, actions: %v", fake.GetLog())
+	}
+}
+
+// An NFS mount whose server is away cannot be told apart from a slow one, and
+// tearing it down would not help, so NFS keeps the plain idempotent answer.
+func TestNodePublishVolume_NeverProbesNFSTarget(t *testing.T) {
+	target := stagingDir(t)
+	stubStatfs(t, 0, syscall.EIO)
+	stubMountProbe(t, syscall.EIO)
+
+	ns, fake := newTestNodeServer(t, []mount.MountPoint{{Device: "nas:/export", Path: target, Type: "nfs4"}})
+
+	if _, err := ns.NodePublishVolume(context.Background(), publishRequest(ProtocolNFS, "", target)); err != nil {
+		t.Fatalf("NodePublishVolume() on an existing NFS mount = %v, want nil", err)
+	}
+	if unmounted(fake, target) {
+		t.Errorf("an NFS publish mount must never be released, actions: %v", fake.GetLog())
+	}
+}

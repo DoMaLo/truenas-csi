@@ -2,6 +2,7 @@ package driver
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -19,22 +20,39 @@ var (
 	errProbePending = errors.New("an earlier read probe has not returned")
 )
 
-// probesInFlight holds the paths with a probe still running. A probe stuck in
-// uninterruptible I/O cannot be cancelled, so a second one is never started for
-// the same path: the caller is told the earlier one is pending instead, which
-// keeps a hung device from accumulating one goroutine per check.
+// probesInFlight holds the mounts with a probe still running, keyed by path and
+// device. A probe stuck in uninterruptible I/O cannot be cancelled, so a second
+// one is never started for the same mount: the caller is told the earlier one is
+// pending instead, which keeps a hung device from accumulating one goroutine per
+// check. The device is part of the key so that a probe left hanging on a mount
+// that was since replaced at the same path does not condemn the new one.
 var probesInFlight sync.Map
+
+func probeKey(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return fmt.Sprintf("%s|%d", path, uint64(st.Dev)), nil //nolint:unconvert // width differs by platform
+	}
+	return path, nil
+}
 
 // probeMount reads the directory at path, the cheapest operation that still
 // reaches the filesystem rather than the page cache. Overridable in tests.
 var probeMount = func(path string) error {
-	if _, busy := probesInFlight.LoadOrStore(path, struct{}{}); busy {
+	key, err := probeKey(path)
+	if err != nil {
+		return err
+	}
+	if _, busy := probesInFlight.LoadOrStore(key, struct{}{}); busy {
 		return errProbePending
 	}
 	done := make(chan error, 1)
 	go func() {
 		err := readDirProbe(path)
-		probesInFlight.Delete(path)
+		probesInFlight.Delete(key)
 		done <- err
 	}()
 
@@ -83,4 +101,10 @@ func isDeadMountError(err error) bool {
 		}
 	}
 	return false
+}
+
+// isSlowProbeError reports whether err only says the probe did not answer in time,
+// as opposed to the filesystem reporting a failure.
+func isSlowProbeError(err error) bool {
+	return errors.Is(err, errProbeTimeout) || errors.Is(err, errProbePending)
 }
