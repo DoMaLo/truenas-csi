@@ -473,6 +473,9 @@ func (h *NVMeOFHandler) Publish(ctx context.Context, req *PublishRequest) error 
 	if err != nil || notMounted {
 		return fmt.Errorf("volume not staged at %s", req.StagingPath)
 	}
+	if reason := unusableStagedMountReason(req.StagingPath, req.ReadOnly); reason != "" {
+		return fmt.Errorf("volume staged at %s is unusable: %s", req.StagingPath, reason)
+	}
 
 	if err := os.MkdirAll(req.TargetPath, 0o750); err != nil {
 		return fmt.Errorf("failed to create target directory: %w", err)

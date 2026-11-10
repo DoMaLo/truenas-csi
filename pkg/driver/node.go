@@ -186,10 +186,12 @@ func readOnlyRequested(capability *csi.VolumeCapability) bool {
 // path cannot be reused, or "" when it can be.
 //
 // A mount that outlives a storage-side interruption is left either unresponsive or
-// permanently read-only (ext4 aborts to read-only on I/O error). Repairing the
-// filesystem on the appliance does not help while that mount is still in place: the
-// staged filesystem is never re-read, so every pod bind-mounted onto it keeps
-// failing with EROFS. Such a mount is re-staged instead of being reused.
+// permanently read-only (ext4 aborts to read-only on I/O error). XFS often stays
+// read-write in statfs flags but still returns EIO on writes, so a short write
+// probe is used as well. Repairing the filesystem on the appliance does not help
+// while that mount is still in place: the staged filesystem is never re-read, so
+// every pod bind-mounted onto it keeps failing. Such a mount is re-staged instead
+// of being reused.
 func unusableStagedMountReason(path string, readOnly bool) string {
 	var stat syscall.Statfs_t
 	if err := statfs(path, &stat); err != nil {
@@ -197,6 +199,11 @@ func unusableStagedMountReason(path string, readOnly bool) string {
 	}
 	if !readOnly && stat.Flags&statfsFlagReadOnly != 0 {
 		return "staged filesystem is mounted read-only but read-write access was requested"
+	}
+	if !readOnly {
+		if err := writeProbeMount(path); err != nil {
+			return fmt.Sprintf("staged filesystem failed write probe: %v", err)
+		}
 	}
 	return ""
 }
@@ -392,8 +399,18 @@ func (s *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 			return nil, status.Errorf(codes.Internal, "failed to check mount point: %v", err)
 		}
 		if !notMounted {
-			s.driver.Log().V(LogLevelDebug).Info("Volume already mounted", "volumeId", req.VolumeId, "targetPath", req.TargetPath)
-			return &csi.NodePublishVolumeResponse{}, nil
+			// A bind that survived a storage outage can look mounted while returning
+			// EIO/EROFS. Tear it down so Publish remounts from a healthy staging path.
+			if reason := unusableStagedMountReason(req.TargetPath, req.Readonly || readOnlyRequested(req.VolumeCapability)); reason != "" {
+				s.driver.Log().Info("Existing publish mount is unusable, publishing again",
+					"volumeId", req.VolumeId, "targetPath", req.TargetPath, "reason", reason)
+				if err := s.mounter.Unmount(req.TargetPath); err != nil {
+					return nil, status.Errorf(codes.Internal, "failed to release the unusable publish mount: %v", err)
+				}
+			} else {
+				s.driver.Log().V(LogLevelDebug).Info("Volume already mounted", "volumeId", req.VolumeId, "targetPath", req.TargetPath)
+				return &csi.NodePublishVolumeResponse{}, nil
+			}
 		}
 	}
 

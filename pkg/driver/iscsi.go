@@ -418,10 +418,15 @@ func (h *ISCSIHandler) Publish(ctx context.Context, req *PublishRequest) error {
 		return fmt.Errorf("staging path is required for iSCSI mount volumes")
 	}
 
-	// Verify staging path is mounted
+	// Verify staging path is mounted and still usable. After a network outage the
+	// mount point can remain while the filesystem is read-only or returns EIO;
+	// bind-mounting that into the pod silently hands the workload a dead volume.
 	notMounted, err := h.mounter.IsLikelyNotMountPoint(req.StagingPath)
 	if err != nil || notMounted {
 		return fmt.Errorf("volume not staged at %s", req.StagingPath)
+	}
+	if reason := unusableStagedMountReason(req.StagingPath, req.ReadOnly); reason != "" {
+		return fmt.Errorf("volume staged at %s is unusable: %s", req.StagingPath, reason)
 	}
 
 	// Create target directory

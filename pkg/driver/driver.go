@@ -602,6 +602,12 @@ func (d *Driver) Run(ctx context.Context) error {
 		go controller.sweepCloneSnapshots(ctx)
 	}
 
+	// Node plugin: repair staged iSCSI/NVMe mounts left dead after a transient
+	// path outage while kubelet still considers them staged/published.
+	if node, ok := d.nodeServer.(*NodeServer); ok {
+		node.StartMountHealer(ctx)
+	}
+
 	// Metrics are optional and must never keep the driver from serving volumes, so
 	// a listener that cannot be opened is reported and left behind.
 	if d.metricsAddr != "" {

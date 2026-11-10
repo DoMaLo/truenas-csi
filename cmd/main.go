@@ -168,5 +168,9 @@ func loadEnvConfig(config *driver.DriverConfig) error {
 		config.MetricsAddr = os.Getenv("TRUENAS_METRICS_ADDR")
 	}
 
+	// Optional node-only settings consumed directly by the mount healer:
+	//   TRUENAS_MOUNT_HEAL_INTERVAL — default 30s; set 0 to disable
+	//   TRUENAS_KUBELET_CSI_PATH    — default /var/lib/kubelet/plugins/kubernetes.io/csi
+
 	return nil
 }
