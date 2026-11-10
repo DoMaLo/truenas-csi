@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -43,6 +46,7 @@ func (h *ISCSIHandler) ensureISCSISession(ctx context.Context, config *ISCSIConf
 	}
 	if exists {
 		h.log.V(LogLevelDebug).Info("iSCSI session already up", "iqn", config.TargetIQN)
+		h.applyReplacementTimeout(config.TargetIQN)
 		return nil
 	}
 
@@ -58,6 +62,16 @@ func (h *ISCSIHandler) ensureISCSISession(ctx context.Context, config *ISCSIConf
 		if _, err := runISCSIAdm(ctx, iscsiadmTimeout, append(append(node, "-o", "update"), chap...)...); err != nil {
 			// The arguments hold the CHAP secrets, so the error leaves them out.
 			return fmt.Errorf("failed to set the CHAP credentials on the iSCSI node record for %s: %w", config.TargetIQN, withCommandOutput(err))
+		}
+	}
+
+	if h.replacementTimeout > 0 {
+		secs := strconv.Itoa(int(h.replacementTimeout.Seconds()))
+		args := append(append(node, "-o", "update"), "-n", "node.session.timeo.replacement_timeout", "-v", secs)
+		if _, err := runISCSIAdm(ctx, iscsiadmTimeout, args...); err != nil {
+			// The host default still works, it only recovers from shorter outages.
+			h.log.Info("Failed to set the iSCSI replacement timeout, keeping the host default",
+				"iqn", config.TargetIQN, "error", withCommandOutput(err).Error())
 		}
 	}
 
@@ -146,4 +160,69 @@ func runISCSIAdm(ctx context.Context, timeout time.Duration, args ...string) ([]
 func isISCSIExitCode(err error, code int) bool {
 	var exitErr *exec.ExitError
 	return errors.As(err, &exitErr) && exitErr.ExitCode() == code
+}
+
+// applyReplacementTimeout sets the configured replacement timeout on the live
+// sessions to iqn. The node record only takes effect at the next login, so a
+// session that was up before the setting was configured would otherwise keep the
+// old value until the volume is staged again.
+func (h *ISCSIHandler) applyReplacementTimeout(iqn string) {
+	if h.replacementTimeout <= 0 {
+		return
+	}
+	n, err := setISCSIRecoveryTimeout(iqn, h.replacementTimeout)
+	if err != nil {
+		h.log.Info("Failed to set the iSCSI replacement timeout on a live session",
+			"iqn", iqn, "error", err.Error())
+		return
+	}
+	if n > 0 {
+		h.log.V(LogLevelDebug).Info("Set the iSCSI replacement timeout on live sessions",
+			"iqn", iqn, "sessions", n, "timeout", h.replacementTimeout.String())
+	}
+}
+
+// applyReplacementTimeoutToStagedVolumes applies the replacement timeout to the
+// sessions of every volume with a connector file, which covers volumes staged
+// before the node plugin started.
+func (h *ISCSIHandler) applyReplacementTimeoutToStagedVolumes() {
+	if h.replacementTimeout <= 0 {
+		return
+	}
+	entries, err := os.ReadDir(connectorDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".connector") {
+			continue
+		}
+		if c := h.readConnectorDirect(filepath.Join(connectorDir, entry.Name())); c != nil && c.TargetIqn != "" {
+			h.applyReplacementTimeout(c.TargetIqn)
+		}
+	}
+}
+
+// setISCSIRecoveryTimeout writes the recovery timeout of each live session to iqn
+// through sysfs, and returns how many it changed.
+func setISCSIRecoveryTimeout(iqn string, timeout time.Duration) (int, error) {
+	sessions, err := filepath.Glob(filepath.Join(sysfsRoot, "class", "iscsi_session", "session*"))
+	if err != nil {
+		return 0, err
+	}
+	value := []byte(strconv.Itoa(int(timeout.Seconds())))
+	changed := 0
+	var errs []error
+	for _, dir := range sessions {
+		name, err := os.ReadFile(filepath.Join(dir, "targetname"))
+		if err != nil || strings.TrimSpace(string(name)) != iqn {
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(dir, "recovery_tmo"), value, 0o644); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		changed++
+	}
+	return changed, errors.Join(errs...)
 }

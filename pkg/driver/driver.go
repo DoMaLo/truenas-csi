@@ -250,6 +250,9 @@ type Driver struct {
 	metrics     *Metrics
 	metricsAddr string
 
+	mountHeal               MountHealConfig
+	iscsiReplacementTimeout time.Duration
+
 	controllerCaps []*csi.ControllerServiceCapability
 	nodeCaps       []*csi.NodeServiceCapability
 	pluginCaps     []*csi.PluginCapability
@@ -300,6 +303,15 @@ type DriverConfig struct {
 	// MetricsAddr is the listen address for the Prometheus endpoint (for example
 	// ":8080"). Empty leaves the endpoint disabled.
 	MetricsAddr string
+
+	// MountHeal configures the node plugin's mount healer. A zero Interval leaves
+	// it disabled.
+	MountHeal MountHealConfig
+
+	// ISCSIReplacementTimeout is how long the kernel keeps I/O queued for an iSCSI
+	// session whose connection dropped, before failing it to the filesystem. Zero
+	// leaves the host's setting.
+	ISCSIReplacementTimeout time.Duration
 
 	// Logger is the structured logger for the driver and client.
 	// If not set, logging for the client will be disabled.
@@ -510,6 +522,9 @@ func NewDriver(config *DriverConfig) (*Driver, error) {
 		nvmeBaseNQN:   nvmeBaseNQN,
 		metrics:       metrics,
 		metricsAddr:   config.MetricsAddr,
+		mountHeal:     config.MountHeal,
+
+		iscsiReplacementTimeout: config.ISCSIReplacementTimeout,
 	}
 
 	if err := d.metrics.RegisterConnectionState(truenasClient.Connected, truenasClient.Reconnects); err != nil {
@@ -600,6 +615,19 @@ func (d *Driver) Run(ctx context.Context) error {
 	// earlier versions left. In the background, so volumes are served meanwhile.
 	if controller, ok := d.controllerServer.(*ControllerServer); ok {
 		go controller.sweepCloneSnapshots(ctx)
+	}
+
+	if node, ok := d.nodeServer.(*NodeServer); ok {
+		go node.iscsiHandler.applyReplacementTimeoutToStagedVolumes()
+	}
+
+	if node, ok := d.nodeServer.(*NodeServer); ok && d.mountHeal.Interval > 0 {
+		healer, err := newMountHealer(node, d.mountHeal)
+		if err != nil {
+			d.log.Error(err, "Mount healer could not start, serving volumes without it")
+		} else {
+			go healer.run(ctx)
+		}
 	}
 
 	// Metrics are optional and must never keep the driver from serving volumes, so

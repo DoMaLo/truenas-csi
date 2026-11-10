@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/truenas/truenas-csi/pkg/driver"
 	"k8s.io/klog/v2/textlogger"
@@ -166,6 +167,36 @@ func loadEnvConfig(config *driver.DriverConfig) error {
 	// variable but exits on an unknown flag.
 	if config.MetricsAddr == "" {
 		config.MetricsAddr = os.Getenv("TRUENAS_METRICS_ADDR")
+	}
+
+	// Optional: the node plugin's mount healer, disabled unless an interval is set.
+	// See docs/mount-heal.md.
+	if val := os.Getenv("TRUENAS_MOUNT_HEAL_INTERVAL"); val != "" {
+		interval, err := time.ParseDuration(val)
+		if err != nil {
+			return fmt.Errorf("TRUENAS_MOUNT_HEAL_INTERVAL: %w", err)
+		}
+		config.MountHeal.Interval = interval
+	}
+	if val := os.Getenv("TRUENAS_MOUNT_HEAL_COOLDOWN"); val != "" {
+		cooldown, err := time.ParseDuration(val)
+		if err != nil {
+			return fmt.Errorf("TRUENAS_MOUNT_HEAL_COOLDOWN: %w", err)
+		}
+		config.MountHeal.Cooldown = cooldown
+	}
+	config.MountHeal.KubeletDir = os.Getenv("TRUENAS_KUBELET_DIR")
+
+	// Optional: how long iSCSI I/O stays queued through a lost connection.
+	if val := os.Getenv("TRUENAS_ISCSI_REPLACEMENT_TIMEOUT"); val != "" {
+		timeout, err := time.ParseDuration(val)
+		if err != nil {
+			return fmt.Errorf("TRUENAS_ISCSI_REPLACEMENT_TIMEOUT: %w", err)
+		}
+		if timeout < time.Second {
+			return fmt.Errorf("TRUENAS_ISCSI_REPLACEMENT_TIMEOUT: %s is below one second", timeout)
+		}
+		config.ISCSIReplacementTimeout = timeout
 	}
 
 	return nil

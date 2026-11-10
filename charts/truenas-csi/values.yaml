@@ -148,6 +148,19 @@ node:
   podAnnotations: {}
   podLabels: {}
   priorityClassName: system-node-critical
+  # How long the kernel keeps iSCSI I/O queued through a lost connection
+  # before failing it to the filesystem, for example 5m. An outage shorter than
+  # this passes with I/O merely stalled; a longer one fails the filesystem.
+  # Empty leaves the host's open-iscsi setting (120s by default).
+  iscsiReplacementTimeout: ""
+  # Restart pods whose block volume died during a storage outage, so kubelet
+  # stages it again. Grants the node plugin permission to delete pods. See
+  # docs/mount-heal.md.
+  mountHeal:
+    enabled: false
+    interval: 1m
+    # Minimum time between two restarts for the same volume.
+    cooldown: 10m
 
 # Prometheus metrics. See docs/metrics.md.
 metrics:

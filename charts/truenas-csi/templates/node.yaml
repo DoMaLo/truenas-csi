@@ -66,6 +66,18 @@ spec:
             - "--v={{ .Values.logLevel }}"
           env:
             {{- include "truenas-csi.driverEnv" (dict "ctx" . "metricsKey" "nodeMetricsAddr") | nindent 12 }}
+            {{- with .Values.node.iscsiReplacementTimeout }}
+            - name: TRUENAS_ISCSI_REPLACEMENT_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.node.mountHeal.enabled }}
+            - name: TRUENAS_MOUNT_HEAL_INTERVAL
+              value: {{ .Values.node.mountHeal.interval | quote }}
+            - name: TRUENAS_MOUNT_HEAL_COOLDOWN
+              value: {{ .Values.node.mountHeal.cooldown | quote }}
+            - name: TRUENAS_KUBELET_DIR
+              value: {{ .Values.kubeletDir | quote }}
+            {{- end }}
           {{- if .Values.metrics.node.enabled }}
           ports:
             - name: metrics

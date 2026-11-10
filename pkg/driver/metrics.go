@@ -78,6 +78,7 @@ type Metrics struct {
 	volumeOps    *prometheus.CounterVec
 	apiCalls     *prometheus.CounterVec
 	apiDuration  *prometheus.HistogramVec
+	mountHeal    *prometheus.CounterVec
 }
 
 // NewMetrics creates the driver's collectors. Metrics are always collected; only
@@ -113,6 +114,11 @@ func NewMetrics() *Metrics {
 			Help:      "Time each TrueNAS API call took, including any wait for a reconnect, by JSON-RPC method.",
 			Buckets:   metricsDurationBuckets,
 		}, []string{"method"}),
+		mountHeal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "mount_heal_actions_total",
+			Help:      "What the node mount healer found and did, by action: unusable_mount, portal_unreachable, no_consumers, pod_deleted, pod_skipped_unmanaged, pod_delete_failed, list_pods_failed, consumer_not_found, gave_up.",
+		}, []string{"action"}),
 	}
 
 	m.registry.MustRegister(
@@ -121,6 +127,7 @@ func NewMetrics() *Metrics {
 		m.volumeOps,
 		m.apiCalls,
 		m.apiDuration,
+		m.mountHeal,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
@@ -196,6 +203,15 @@ func (m *Metrics) RecordAPICall(method string, duration time.Duration, err error
 	}
 	m.apiCalls.WithLabelValues(method, operationStatus(err)).Inc()
 	m.apiDuration.WithLabelValues(method).Observe(duration.Seconds())
+}
+
+// RecordMountHeal counts one mount healer outcome. The action comes from the fixed
+// set in heal.go.
+func (m *Metrics) RecordMountHeal(action string) {
+	if m == nil {
+		return
+	}
+	m.mountHeal.WithLabelValues(action).Inc()
 }
 
 // Handler serves the metrics endpoint. Only the metrics path is routed: profiling

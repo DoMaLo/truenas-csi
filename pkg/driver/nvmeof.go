@@ -394,15 +394,17 @@ func (h *NVMeOFHandler) loadConnector(volumeID string) *nvmeConnectorInfo {
 func (h *NVMeOFHandler) Unstage(ctx context.Context, req *UnstageRequest) error {
 	h.log.V(LogLevelDebug).Info("NVMe-oF Unstage", "volumeId", req.VolumeID, "stagingPath", req.StagingPath)
 
-	notMounted, err := h.mounter.IsLikelyNotMountPoint(req.StagingPath)
+	// A staging mount that died in a storage outage cannot even be stat'ed; it is
+	// unmounted all the same, or the volume could never be released.
+	mounted, corruptErr, err := checkMountPoint(h.mounter, req.StagingPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return h.cleanupNVMeSession(ctx, req.VolumeID)
-		}
 		return fmt.Errorf("failed to check mount point: %w", err)
 	}
+	if corruptErr != nil {
+		h.log.Info("Staging mount cannot be read, unmounting it anyway", "stagingPath", req.StagingPath, "error", corruptErr.Error())
+	}
 
-	if !notMounted {
+	if mounted {
 		if err := h.mounter.Unmount(req.StagingPath); err != nil {
 			return fmt.Errorf("failed to unmount staging path: %w", err)
 		}
@@ -469,9 +471,17 @@ func (h *NVMeOFHandler) Publish(ctx context.Context, req *PublishRequest) error 
 		return fmt.Errorf("staging path is required for NVMe-oF mount volumes")
 	}
 
-	notMounted, err := h.mounter.IsLikelyNotMountPoint(req.StagingPath)
-	if err != nil || notMounted {
+	mounted, corruptErr, err := checkMountPoint(h.mounter, req.StagingPath)
+	switch {
+	case err != nil:
+		return fmt.Errorf("failed to check staging path %s: %w", req.StagingPath, err)
+	case !mounted:
 		return fmt.Errorf("volume not staged at %s", req.StagingPath)
+	case corruptErr != nil:
+		return fmt.Errorf("volume staged at %s is unusable: staging mount cannot be read: %w", req.StagingPath, corruptErr)
+	}
+	if reason := unusableStagedMountReason(req.StagingPath, readOnlyRequested(req.VolumeCapability)); reason != "" {
+		return fmt.Errorf("volume staged at %s is unusable: %s", req.StagingPath, reason)
 	}
 
 	if err := os.MkdirAll(req.TargetPath, 0o750); err != nil {
@@ -523,14 +533,11 @@ func (h *NVMeOFHandler) publishBlockVolume(req *PublishRequest) error {
 func (h *NVMeOFHandler) Unpublish(ctx context.Context, req *UnpublishRequest) error {
 	h.log.V(LogLevelDebug).Info("NVMe-oF Unpublish", "volumeId", req.VolumeID, "targetPath", req.TargetPath)
 
-	notMounted, err := h.mounter.IsLikelyNotMountPoint(req.TargetPath)
+	mounted, _, err := checkMountPoint(h.mounter, req.TargetPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
 		return fmt.Errorf("failed to check mount point: %w", err)
 	}
-	if notMounted {
+	if !mounted {
 		return nil
 	}
 	if err := h.mounter.Unmount(req.TargetPath); err != nil {

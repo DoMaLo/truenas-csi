@@ -18,6 +18,7 @@ A Container Storage Interface (CSI) driver for [TrueNAS 25.10.0+](https://www.tr
 - **Prometheus metrics** - Optional `/metrics` endpoint for CSI operations and TrueNAS API health ([docs](docs/metrics.md))
 - **Private CA trust** - Verify a TrueNAS certificate issued by your own CA ([docs](docs/tls.md))
 - **Outbound proxy** - Reach the TrueNAS API through an HTTP proxy ([docs](docs/proxy.md))
+- **Storage outage recovery** - Dead iSCSI/NVMe-oF mounts are released and staged again, an optional healer restarts the pods using them, and the iSCSI replacement timeout is configurable ([docs](docs/mount-heal.md))
 
 ## Requirements
 

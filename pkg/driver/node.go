@@ -30,6 +30,28 @@ const (
 // statfs is syscall.Statfs; overridable in tests.
 var statfs = syscall.Statfs
 
+// sysfsRoot is overridable in tests.
+var sysfsRoot = "/sys"
+
+// checkMountPoint reports whether path is a mount point. A mount whose root can no
+// longer be read counts as mounted, with the error in corruptErr: a shut-down XFS
+// answers stat with EIO, and a lost server ENOTCONN or ESTALE. Such a mount is still
+// in the mount table and has to be unmounted, which a plain IsLikelyNotMountPoint
+// error would stop every teardown short of.
+func checkMountPoint(m mount.Interface, path string) (mounted bool, corruptErr, err error) {
+	notMounted, err := m.IsLikelyNotMountPoint(path)
+	switch {
+	case err == nil:
+		return !notMounted, nil, nil
+	case os.IsNotExist(err):
+		return false, nil, nil
+	case mount.IsCorruptedMnt(err):
+		return true, err, nil
+	default:
+		return false, nil, err
+	}
+}
+
 // NodeServer implements the CSI Node service
 type NodeServer struct {
 	driver        *Driver
@@ -68,6 +90,7 @@ func NewNodeServer(cfg *NodeServerConfig) (*NodeServer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create iSCSI handler: %w", err)
 	}
+	iscsiHandler.replacementTimeout = cfg.Driver.iscsiReplacementTimeout
 
 	nvmeofHandler, err := NewNVMeOFHandler(safeMounter, cfg.Driver.Log())
 	if err != nil {
@@ -186,19 +209,54 @@ func readOnlyRequested(capability *csi.VolumeCapability) bool {
 // path cannot be reused, or "" when it can be.
 //
 // A mount that outlives a storage-side interruption is left either unresponsive or
-// permanently read-only (ext4 aborts to read-only on I/O error). Repairing the
-// filesystem on the appliance does not help while that mount is still in place: the
-// staged filesystem is never re-read, so every pod bind-mounted onto it keeps
-// failing with EROFS. Such a mount is re-staged instead of being reused.
+// permanently read-only (ext4 aborts to read-only on I/O error). A shut-down XFS
+// keeps its read-write flag and answers statfs, so the directory is also read:
+// readdir always reaches the filesystem, which fails it with EIO once shut down.
+// Repairing the filesystem on the appliance does not help while that mount is
+// still in place: the staged filesystem is never re-read, so every pod
+// bind-mounted onto it keeps failing. Such a mount is re-staged instead of being
+// reused.
+//
+// A probe that merely ran out of time does not count here. Stage acts on the
+// verdict by logging out of the session, and kubelet calls it again for volumes
+// that are in use whenever it restarts: a volume that is only slow under load
+// must not lose its session to that. A dead filesystem answers with an error
+// straight away; slow-only volumes are left to the mount healer, which wants to
+// see them fail several times first.
 func unusableStagedMountReason(path string, readOnly bool) string {
+	reason, soft := stagedMountVerdict(path, readOnly)
+	if soft {
+		return ""
+	}
+	return reason
+}
+
+// isBlockProtocol reports whether the publish context names a block protocol, the
+// ones whose mounts the driver can tell apart from a slow one.
+func isBlockProtocol(publishContext map[string]string) bool {
+	switch publishContext[PublishContextProtocol] {
+	case ProtocolISCSI, ProtocolNVMeOF:
+		return true
+	}
+	return false
+}
+
+// stagedMountVerdict is unusableStagedMountReason that also says whether the
+// verdict rests on a probe that merely ran out of time. A slow answer is weaker
+// evidence than an I/O error: a volume under heavy load can be slow without being
+// dead, so callers that act on it repeatedly want to see it more than once.
+func stagedMountVerdict(path string, readOnly bool) (reason string, soft bool) {
 	var stat syscall.Statfs_t
 	if err := statfs(path, &stat); err != nil {
-		return fmt.Sprintf("staged filesystem is not responding: %v", err)
+		return fmt.Sprintf("staged filesystem is not responding: %v", err), false
 	}
 	if !readOnly && stat.Flags&statfsFlagReadOnly != 0 {
-		return "staged filesystem is mounted read-only but read-write access was requested"
+		return "staged filesystem is mounted read-only but read-write access was requested", false
 	}
-	return ""
+	if err := probeMount(path); isDeadMountError(err) {
+		return fmt.Sprintf("staged filesystem failed a read probe: %v", err), isSlowProbeError(err)
+	}
+	return "", false
 }
 
 // validateVolumeCapability checks if the requested capability is supported
@@ -265,12 +323,17 @@ func (s *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 	// Check if already staged (idempotency), but only reuse a mount that still
 	// works: a dead or read-only staging mount is silently inherited by every pod
 	// that publishes from it, so it is torn down and staged again instead.
-	notMounted, err := s.mounter.IsLikelyNotMountPoint(req.StagingTargetPath)
-	if err != nil && !os.IsNotExist(err) {
+	mounted, corruptErr, err := checkMountPoint(s.mounter, req.StagingTargetPath)
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to check staging path: %v", err)
 	}
-	if !notMounted {
-		reason := unusableStagedMountReason(req.StagingTargetPath, readOnlyRequested(req.VolumeCapability))
+	if mounted {
+		reason := ""
+		if corruptErr != nil {
+			reason = fmt.Sprintf("staging mount cannot be read: %v", corruptErr)
+		} else {
+			reason = unusableStagedMountReason(req.StagingTargetPath, readOnlyRequested(req.VolumeCapability))
+		}
 		if reason == "" {
 			s.driver.Log().V(LogLevelDebug).Info("Volume already staged", "volumeId", req.VolumeId, "stagingTargetPath", req.StagingTargetPath)
 			return &csi.NodeStageVolumeResponse{}, nil
@@ -380,6 +443,7 @@ func (s *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	isBlockVolume := req.VolumeCapability.GetBlock() != nil
 
 	// Check if already mounted/published (idempotency)
+	mountedBlockTarget := false
 	if isBlockVolume {
 		// For block volumes, check if target path exists and is a device
 		if _, err := os.Stat(req.TargetPath); err == nil {
@@ -387,13 +451,21 @@ func (s *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 			return &csi.NodePublishVolumeResponse{}, nil
 		}
 	} else {
-		notMounted, err := s.mounter.IsLikelyNotMountPoint(req.TargetPath)
-		if err != nil && !os.IsNotExist(err) {
+		mounted, corruptErr, err := checkMountPoint(s.mounter, req.TargetPath)
+		if err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to check mount point: %v", err)
 		}
-		if !notMounted {
-			s.driver.Log().V(LogLevelDebug).Info("Volume already mounted", "volumeId", req.VolumeId, "targetPath", req.TargetPath)
-			return &csi.NodePublishVolumeResponse{}, nil
+		if corruptErr != nil && !isBlockProtocol(req.PublishContext) {
+			return nil, status.Errorf(codes.Internal, "failed to check mount point: %v", corruptErr)
+		}
+		if mounted {
+			if !isBlockProtocol(req.PublishContext) {
+				s.driver.Log().V(LogLevelDebug).Info("Volume already mounted", "volumeId", req.VolumeId, "targetPath", req.TargetPath)
+				return &csi.NodePublishVolumeResponse{}, nil
+			}
+			// A bind that survived a storage outage can look mounted while
+			// returning EIO. Whether it did is decided under the lock below.
+			mountedBlockTarget = true
 		}
 	}
 
@@ -403,6 +475,34 @@ func (s *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 		return nil, status.Errorf(codes.Aborted, "operation already in progress for volume %s", req.VolumeId)
 	}
 	defer s.ReleaseLock(lockKey)
+
+	if mountedBlockTarget {
+		// Only block volumes get here: a probe of an NFS mount whose server is away
+		// would hang, and tearing that mount down helps nobody.
+		if mounted, corruptErr, err := checkMountPoint(s.mounter, req.TargetPath); err == nil && mounted {
+			reason := ""
+			if corruptErr != nil {
+				reason = fmt.Sprintf("publish mount cannot be read: %v", corruptErr)
+			} else {
+				reason = unusableStagedMountReason(req.TargetPath, req.Readonly || readOnlyRequested(req.VolumeCapability))
+			}
+			if reason == "" {
+				s.driver.Log().V(LogLevelDebug).Info("Volume already mounted", "volumeId", req.VolumeId, "targetPath", req.TargetPath)
+				return &csi.NodePublishVolumeResponse{}, nil
+			}
+			s.driver.Log().Info("Existing publish mount is unusable, publishing again",
+				"volumeId", req.VolumeId, "targetPath", req.TargetPath, "reason", reason)
+			if err := s.mounter.Unmount(req.TargetPath); err != nil {
+				return nil, status.Errorf(codes.Internal, "failed to release the unusable publish mount: %v", err)
+			}
+		}
+	}
+
+	if isBlockProtocol(req.PublishContext) && !isBlockVolume {
+		if err := s.ensureStaged(ctx, req); err != nil {
+			return nil, err
+		}
+	}
 
 	// Get appropriate handler
 	handler, err := s.getHandler(req.PublishContext)
@@ -439,6 +539,47 @@ func (s *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 
 	s.driver.Log().V(LogLevelDebug).Info("Successfully published volume", "volumeId", req.VolumeId, "targetPath", req.TargetPath)
 	return &csi.NodePublishVolumeResponse{}, nil
+}
+
+// ensureStaged makes sure the staging mount a filesystem volume is published from
+// is there and works, and stages the volume again when it is not.
+//
+// Kubelet calls NodeStageVolume only while it believes the volume is not staged.
+// A staging mount that died in a storage outage, or disappeared, leaves it
+// believing otherwise, and as long as a pod on the node wants the volume kubelet
+// never unstages it either. Without this the pod would wait for its volume
+// forever. NodeStageVolume replaces a dead staging mount on its own.
+func (s *NodeServer) ensureStaged(ctx context.Context, req *csi.NodePublishVolumeRequest) error {
+	if req.StagingTargetPath == "" {
+		return nil
+	}
+	mounted, corruptErr, err := checkMountPoint(s.mounter, req.StagingTargetPath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to check staging path: %v", err)
+	}
+	var reason string
+	switch {
+	case !mounted:
+		reason = "the volume is not staged"
+	case corruptErr != nil:
+		reason = fmt.Sprintf("staging mount cannot be read: %v", corruptErr)
+	default:
+		reason = unusableStagedMountReason(req.StagingTargetPath, readOnlyRequested(req.VolumeCapability))
+	}
+	if reason == "" {
+		return nil
+	}
+
+	s.driver.Log().Info("Staging mount is missing or unusable at publish, staging the volume again",
+		"volumeId", req.VolumeId, "stagingTargetPath", req.StagingTargetPath, "reason", reason)
+	_, err = s.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
+		VolumeId:          req.VolumeId,
+		StagingTargetPath: req.StagingTargetPath,
+		VolumeCapability:  req.VolumeCapability,
+		PublishContext:    req.PublishContext,
+		VolumeContext:     req.VolumeContext,
+	})
+	return err
 }
 
 // NodeUnpublishVolume unmounts the volume from the target path.

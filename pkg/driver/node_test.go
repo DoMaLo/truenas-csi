@@ -41,6 +41,14 @@ func stubStatfs(t *testing.T, flags int64, statErr error) {
 	t.Cleanup(func() { statfs = orig })
 }
 
+// stubMountProbe replaces the read probe used by unusableStagedMountReason.
+func stubMountProbe(t *testing.T, err error) {
+	t.Helper()
+	orig := probeMount
+	probeMount = func(string) error { return err }
+	t.Cleanup(func() { probeMount = orig })
+}
+
 // newTestNodeServer builds a NodeServer backed by a fake mounter, with all three
 // protocol handlers wired to it.
 func newTestNodeServer(t *testing.T, mounts []mount.MountPoint) (*NodeServer, *mount.FakeMounter) {
@@ -195,6 +203,7 @@ func TestUnusableStagedMountReason(t *testing.T) {
 		name       string
 		flags      int64
 		statErr    error
+		probeErr   error
 		readOnly   bool
 		wantReason bool
 	}{
@@ -202,11 +211,18 @@ func TestUnusableStagedMountReason(t *testing.T) {
 		{name: "read-only mount when read-write was requested", flags: statfsFlagReadOnly, wantReason: true},
 		{name: "read-only mount when read-only was requested", flags: statfsFlagReadOnly, readOnly: true},
 		{name: "statfs failure", statErr: syscall.EIO, wantReason: true},
+		{name: "read probe I/O error", probeErr: syscall.EIO, wantReason: true},
+		{name: "read probe I/O error on a read-only volume", probeErr: syscall.EIO, readOnly: true, wantReason: true},
+		// Stage logs out of the session on this verdict; a slow volume keeps it.
+		{name: "read probe timed out", probeErr: errProbeTimeout},
+		{name: "read probe still pending", probeErr: errProbePending},
+		{name: "read probe error unrelated to storage", probeErr: syscall.EACCES},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			stubStatfs(t, tt.flags, tt.statErr)
+			stubMountProbe(t, tt.probeErr)
 			reason := unusableStagedMountReason("/staging", tt.readOnly)
 			if (reason != "") != tt.wantReason {
 				t.Errorf("unusableStagedMountReason() = %q, want a reason: %v", reason, tt.wantReason)
@@ -249,6 +265,7 @@ func TestNodeStageVolume_ReusesHealthyMount(t *testing.T) {
 	useTempConnectorDir(t)
 	staging := stagingDir(t)
 	stubStatfs(t, 0, nil)
+	stubMountProbe(t, nil)
 
 	ns, fake := newTestNodeServer(t, []mount.MountPoint{{Device: "/dev/sda", Path: staging, Type: "ext4"}})
 
@@ -267,6 +284,7 @@ func TestNodeStageVolume_RestagesUnusableMount(t *testing.T) {
 	useTempConnectorDir(t)
 	staging := stagingDir(t)
 	stubStatfs(t, statfsFlagReadOnly, nil)
+	stubMountProbe(t, nil)
 
 	ns, fake := newTestNodeServer(t, []mount.MountPoint{{Device: "/dev/sda", Path: staging, Type: "ext4"}})
 
@@ -433,5 +451,190 @@ func TestPluginCapabilities_ExcludeAccessibilityConstraints(t *testing.T) {
 		if c.GetService().GetType() == csi.PluginCapability_Service_VOLUME_ACCESSIBILITY_CONSTRAINTS {
 			t.Error("driver advertises VOLUME_ACCESSIBILITY_CONSTRAINTS but reports no topology")
 		}
+	}
+}
+
+func publishRequest(protocol, staging, target string) *csi.NodePublishVolumeRequest {
+	return &csi.NodePublishVolumeRequest{
+		VolumeId:          "tank/pvc-abc",
+		StagingTargetPath: staging,
+		TargetPath:        target,
+		PublishContext:    map[string]string{PublishContextProtocol: protocol},
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{FsType: DefaultFSType},
+			},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		},
+	}
+}
+
+func unmounted(fake *mount.FakeMounter, target string) bool {
+	for _, action := range fake.GetLog() {
+		if action.Action == mount.FakeActionUnmount && action.Target == target {
+			return true
+		}
+	}
+	return false
+}
+
+// A bind mount that outlived a storage outage is released so Publish can mount it
+// again from a healthy staging path.
+func TestNodePublishVolume_ReplacesDeadBlockTarget(t *testing.T) {
+	useTempConnectorDir(t)
+	target := stagingDir(t)
+	stubStatfs(t, 0, nil)
+	stubMountProbe(t, syscall.EIO)
+
+	ns, fake := newTestNodeServer(t, []mount.MountPoint{{Device: "/dev/sda", Path: target, Type: "xfs"}})
+
+	// Publish itself cannot finish here because nothing is staged; what matters is
+	// that the request did not report the dead mount as published.
+	if _, err := ns.NodePublishVolume(context.Background(), publishRequest(ProtocolISCSI, "/not/staged", target)); err == nil {
+		t.Fatal("NodePublishVolume() reported a dead mount as published")
+	}
+	if !unmounted(fake, target) {
+		t.Errorf("the dead publish mount was not released, actions: %v", fake.GetLog())
+	}
+}
+
+func TestNodePublishVolume_LeavesHealthyBlockTarget(t *testing.T) {
+	useTempConnectorDir(t)
+	target := stagingDir(t)
+	stubStatfs(t, 0, nil)
+	stubMountProbe(t, nil)
+
+	ns, fake := newTestNodeServer(t, []mount.MountPoint{{Device: "/dev/sda", Path: target, Type: "xfs"}})
+
+	if _, err := ns.NodePublishVolume(context.Background(), publishRequest(ProtocolISCSI, "/not/staged", target)); err != nil {
+		t.Fatalf("NodePublishVolume() on a healthy mount = %v, want nil", err)
+	}
+	if unmounted(fake, target) {
+		t.Errorf("a healthy publish mount must be left alone, actions: %v", fake.GetLog())
+	}
+}
+
+// An NFS mount whose server is away cannot be told apart from a slow one, and
+// tearing it down would not help, so NFS keeps the plain idempotent answer.
+func TestNodePublishVolume_NeverProbesNFSTarget(t *testing.T) {
+	target := stagingDir(t)
+	stubStatfs(t, 0, syscall.EIO)
+	stubMountProbe(t, syscall.EIO)
+
+	ns, fake := newTestNodeServer(t, []mount.MountPoint{{Device: "nas:/export", Path: target, Type: "nfs4"}})
+
+	if _, err := ns.NodePublishVolume(context.Background(), publishRequest(ProtocolNFS, "", target)); err != nil {
+		t.Fatalf("NodePublishVolume() on an existing NFS mount = %v, want nil", err)
+	}
+	if unmounted(fake, target) {
+		t.Errorf("an NFS publish mount must never be released, actions: %v", fake.GetLog())
+	}
+}
+
+// eio is what stat returns under a shut-down XFS mount, as seen in the outage.
+func eio(path string) error {
+	return &os.PathError{Op: "stat", Path: path, Err: syscall.EIO}
+}
+
+// After the outage kubelet could not even stat the dead mounts. Unstage must
+// unmount such a staging path all the same, or the volume is never released.
+func TestNodeUnstageVolume_UnmountsUnreadableStagingMount(t *testing.T) {
+	useTempConnectorDir(t)
+	staging := stagingDir(t)
+	ns, fake := newTestNodeServer(t, []mount.MountPoint{{Device: "/dev/sda", Path: staging, Type: "xfs"}})
+	fake.MountCheckErrors = map[string]error{staging: eio(staging)}
+
+	if _, err := ns.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{
+		VolumeId: "tank/pvc-abc", StagingTargetPath: staging,
+	}); err != nil {
+		t.Fatalf("NodeUnstageVolume() on an unreadable mount = %v, want nil", err)
+	}
+	if !unmounted(fake, staging) {
+		t.Errorf("the unreadable staging mount was not unmounted, actions: %v", fake.GetLog())
+	}
+}
+
+func TestNodeStageVolume_RestagesUnreadableMount(t *testing.T) {
+	useTempConnectorDir(t)
+	staging := stagingDir(t)
+	ns, fake := newTestNodeServer(t, []mount.MountPoint{{Device: "/dev/sda", Path: staging, Type: "xfs"}})
+	fake.MountCheckErrors = map[string]error{staging: eio(staging)}
+
+	// Staging cannot complete without a target; it must get past the check.
+	_, err := ns.NodeStageVolume(context.Background(), stageRequest("tank/pvc-abc", staging))
+	if err != nil && strings.Contains(err.Error(), "failed to check staging path") {
+		t.Fatalf("NodeStageVolume() stopped at the mount check: %v", err)
+	}
+	if !unmounted(fake, staging) {
+		t.Errorf("the unreadable staging mount was not replaced, actions: %v", fake.GetLog())
+	}
+}
+
+// A volume whose staging mount is gone or dead while kubelet still believes it
+// staged is staged again by Publish, instead of failing with "volume not staged"
+// until someone intervenes.
+func TestNodePublishVolume_StagesAgainWhenStagingIsMissing(t *testing.T) {
+	useTempConnectorDir(t)
+	staging := filepath.Join(t.TempDir(), "globalmount") // removed, as on w-01/w-06
+	target := filepath.Join(t.TempDir(), "mount")
+	ns, _ := newTestNodeServer(t, nil)
+
+	_, err := ns.NodePublishVolume(context.Background(), publishRequest(ProtocolISCSI, staging, target))
+	if err == nil {
+		t.Fatal("NodePublishVolume() succeeded without a target to stage from")
+	}
+	// The stand-in publish context has no target, so staging fails on that, which
+	// shows Publish went on to stage rather than giving up.
+	if !strings.Contains(err.Error(), "target portal and IQN are required") {
+		t.Errorf("NodePublishVolume() = %v, want it to have tried staging the volume", err)
+	}
+}
+
+func TestNodePublishVolume_StagesAgainWhenStagingIsUnreadable(t *testing.T) {
+	useTempConnectorDir(t)
+	staging := stagingDir(t)
+	target := filepath.Join(t.TempDir(), "mount")
+	ns, fake := newTestNodeServer(t, []mount.MountPoint{{Device: "/dev/sda", Path: staging, Type: "xfs"}})
+	fake.MountCheckErrors = map[string]error{staging: eio(staging)}
+
+	if _, err := ns.NodePublishVolume(context.Background(), publishRequest(ProtocolISCSI, staging, target)); err == nil {
+		t.Fatal("NodePublishVolume() published from an unreadable staging mount")
+	}
+	if !unmounted(fake, staging) {
+		t.Errorf("the unreadable staging mount was not replaced, actions: %v", fake.GetLog())
+	}
+}
+
+func TestNodePublishVolume_ReplacesUnreadableBlockTarget(t *testing.T) {
+	useTempConnectorDir(t)
+	target := stagingDir(t)
+	ns, fake := newTestNodeServer(t, []mount.MountPoint{{Device: "/dev/sda", Path: target, Type: "xfs"}})
+	fake.MountCheckErrors = map[string]error{target: eio(target)}
+
+	_, _ = ns.NodePublishVolume(context.Background(), publishRequest(ProtocolISCSI, "/not/staged", target))
+	if !unmounted(fake, target) {
+		t.Errorf("the unreadable publish mount was not released, actions: %v", fake.GetLog())
+	}
+}
+
+func TestCheckMountPoint(t *testing.T) {
+	dir := stagingDir(t)
+	missing := filepath.Join(t.TempDir(), "gone")
+	fake := mount.NewFakeMounter([]mount.MountPoint{{Device: "/dev/sda", Path: dir}})
+
+	if mounted, corrupt, err := checkMountPoint(fake, dir); !mounted || corrupt != nil || err != nil {
+		t.Errorf("healthy mount: mounted=%v corrupt=%v err=%v", mounted, corrupt, err)
+	}
+	if mounted, corrupt, err := checkMountPoint(fake, missing); mounted || corrupt != nil || err != nil {
+		t.Errorf("missing path: mounted=%v corrupt=%v err=%v", mounted, corrupt, err)
+	}
+	fake.MountCheckErrors = map[string]error{dir: eio(dir)}
+	if mounted, corrupt, err := checkMountPoint(fake, dir); !mounted || corrupt == nil || err != nil {
+		t.Errorf("unreadable mount: mounted=%v corrupt=%v err=%v", mounted, corrupt, err)
+	}
+	other := &os.PathError{Op: "stat", Path: dir, Err: syscall.ELOOP}
+	fake.MountCheckErrors = map[string]error{dir: other}
+	if _, _, err := checkMountPoint(fake, dir); err == nil {
+		t.Error("an error unrelated to a dead mount must be returned")
 	}
 }

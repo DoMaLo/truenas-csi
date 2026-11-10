@@ -222,3 +222,110 @@ func TestStage_LogsInBeforeTheLibrary(t *testing.T) {
 		t.Errorf("logins = %d, want 1; calls:\n%s", n, strings.Join(f.calls(t), "\n"))
 	}
 }
+
+func TestEnsureISCSISession_SetsReplacementTimeoutBeforeLogin(t *testing.T) {
+	f := slowISCSIAdm{dir: t.TempDir(), loginDelay: "0"}
+	f.install(t)
+	h := &ISCSIHandler{log: logr.Discard(), replacementTimeout: 5 * time.Minute}
+
+	if err := h.ensureISCSISession(context.Background(), loginTestConfig(), iscsiLoginTimeout); err != nil {
+		t.Fatalf("ensureISCSISession() = %v", err)
+	}
+	calls := f.calls(t)
+	update, login := indexOf(calls, "node.session.timeo.replacement_timeout -v 300"), indexOf(calls, " -l")
+	if update < 0 || login < 0 || update > login {
+		t.Errorf("want the replacement timeout set before the login; calls:\n%s", strings.Join(calls, "\n"))
+	}
+}
+
+func TestEnsureISCSISession_ReplacementTimeoutUpdateFailureIsNotFatal(t *testing.T) {
+	f := slowISCSIAdm{dir: t.TempDir(), loginDelay: "0", updateExit: 1}
+	f.install(t)
+	h := &ISCSIHandler{log: logr.Discard(), replacementTimeout: time.Minute}
+
+	if err := h.ensureISCSISession(context.Background(), loginTestConfig(), iscsiLoginTimeout); err != nil {
+		t.Errorf("ensureISCSISession() = %v, want the login to go ahead with the host default", err)
+	}
+}
+
+func TestEnsureISCSISession_DefaultLeavesReplacementTimeoutAlone(t *testing.T) {
+	f := slowISCSIAdm{dir: t.TempDir(), loginDelay: "0"}
+	f.install(t)
+	if err := (&ISCSIHandler{log: logr.Discard()}).ensureISCSISession(context.Background(), loginTestConfig(), iscsiLoginTimeout); err != nil {
+		t.Fatal(err)
+	}
+	if n := countCalls(f.calls(t), "replacement_timeout"); n != 0 {
+		t.Errorf("replacement timeout touched without being configured; calls:\n%s", strings.Join(f.calls(t), "\n"))
+	}
+}
+
+// fakeISCSISessions builds /sys/class/iscsi_session with one session per IQN.
+func fakeISCSISessions(t *testing.T, iqns ...string) string {
+	t.Helper()
+	sys := t.TempDir()
+	orig := sysfsRoot
+	sysfsRoot = sys
+	t.Cleanup(func() { sysfsRoot = orig })
+	for i, iqn := range iqns {
+		dir := filepath.Join(sys, "class", "iscsi_session", "session"+strconv.Itoa(i+1))
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "targetname"), []byte(iqn+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "recovery_tmo"), []byte("120\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return sys
+}
+
+func recoveryTimeout(t *testing.T, sys string, session int) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(sys, "class", "iscsi_session", "session"+strconv.Itoa(session), "recovery_tmo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// A session that was up before the timeout was configured gets it live: the node
+// record would only apply at the next login.
+func TestEnsureISCSISession_ExistingSessionGetsReplacementTimeout(t *testing.T) {
+	f := slowISCSIAdm{dir: t.TempDir(), loginDelay: "0"}
+	f.install(t)
+	if err := os.WriteFile(filepath.Join(f.dir, "session"), []byte("tcp: [1] 10.0.0.1:3260,1 "+connectTestIQN+" (non-flash)\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sys := fakeISCSISessions(t, "iqn.other:volume", connectTestIQN)
+
+	h := &ISCSIHandler{log: logr.Discard(), replacementTimeout: 5 * time.Minute}
+	if err := h.ensureISCSISession(context.Background(), loginTestConfig(), iscsiLoginTimeout); err != nil {
+		t.Fatal(err)
+	}
+	if got := recoveryTimeout(t, sys, 2); got != "300" {
+		t.Errorf("recovery_tmo of the volume's session = %s, want 300", got)
+	}
+	if got := recoveryTimeout(t, sys, 1); got != "120" {
+		t.Errorf("recovery_tmo of another target's session = %s, want it untouched", got)
+	}
+}
+
+func TestApplyReplacementTimeoutToStagedVolumes(t *testing.T) {
+	dir := useTempConnectorDir(t)
+	sys := fakeISCSISessions(t, "iqn.test:staged", "iqn.test:foreign")
+	if err := os.WriteFile(filepath.Join(dir, "tank-pvc.connector"),
+		[]byte(`{"volume_name":"tank/pvc","target_iqn":"iqn.test:staged","target_portal":["10.0.0.1:3260"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	(&ISCSIHandler{log: logr.Discard(), replacementTimeout: 10 * time.Minute}).applyReplacementTimeoutToStagedVolumes()
+
+	if got := recoveryTimeout(t, sys, 1); got != "600" {
+		t.Errorf("recovery_tmo of a staged volume's session = %s, want 600", got)
+	}
+	if got := recoveryTimeout(t, sys, 2); got != "120" {
+		t.Errorf("recovery_tmo of a session this driver did not stage = %s, want it untouched", got)
+	}
+}
