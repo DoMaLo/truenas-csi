@@ -148,6 +148,14 @@ node:
   podAnnotations: {}
   podLabels: {}
   priorityClassName: system-node-critical
+  # Restart pods whose block volume died during a storage outage, so kubelet
+  # stages it again. Grants the node plugin permission to delete pods. See
+  # docs/mount-heal.md.
+  mountHeal:
+    enabled: false
+    interval: 1m
+    # Minimum time between two restarts for the same volume.
+    cooldown: 10m
 
 # Prometheus metrics. See docs/metrics.md.
 metrics:

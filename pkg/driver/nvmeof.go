@@ -473,7 +473,7 @@ func (h *NVMeOFHandler) Publish(ctx context.Context, req *PublishRequest) error 
 	if err != nil || notMounted {
 		return fmt.Errorf("volume not staged at %s", req.StagingPath)
 	}
-	if reason := unusableStagedMountReason(req.StagingPath, req.ReadOnly); reason != "" {
+	if reason := unusableStagedMountReason(req.StagingPath, readOnlyRequested(req.VolumeCapability)); reason != "" {
 		return fmt.Errorf("volume staged at %s is unusable: %s", req.StagingPath, reason)
 	}
 

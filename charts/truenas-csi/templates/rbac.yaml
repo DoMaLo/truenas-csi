@@ -109,7 +109,11 @@ rules:
     verbs: ["get"]
   - apiGroups: [""]
     resources: ["pods"]
+    {{- if .Values.node.mountHeal.enabled }}
+    verbs: ["get", "list", "watch", "delete"]
+    {{- else }}
     verbs: ["get", "list", "watch"]
+    {{- end }}
   - apiGroups: ["storage.k8s.io"]
     resources: ["volumeattachments"]
     verbs: ["get", "list", "watch"]

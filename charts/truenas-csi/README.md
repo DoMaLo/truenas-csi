@@ -105,6 +105,9 @@ tag defaults to `v<appVersion>`; the sidecar tags are pinned in `values.yaml`.
 | `node.tolerations` | `[{operator: Exists}]` | Runs on every node by default |
 | `node.podAnnotations` / `.podLabels` | `{}` | Extra node pod metadata |
 | `node.priorityClassName` | `system-node-critical` | Node plugin priority class |
+| `node.mountHeal.enabled` | `false` | Restart controller-owned pods whose block volume died in a storage outage, once the portal answers again. Adds `delete` on pods to the node role. See [docs/mount-heal.md](../../docs/mount-heal.md) |
+| `node.mountHeal.interval` | `1m` | How often the node plugin checks its staged volumes |
+| `node.mountHeal.cooldown` | `10m` | Minimum time between two restarts for the same volume |
 
 ### Metrics
 

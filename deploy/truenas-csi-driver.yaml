@@ -104,6 +104,7 @@ rules:
     verbs: ["get"]
   - apiGroups: [""]
     resources: ["pods"]
+    # Add "delete" when TRUENAS_MOUNT_HEAL_INTERVAL is set on the node plugin.
     verbs: ["get", "list", "watch"]
   - apiGroups: ["storage.k8s.io"]
     resources: ["volumeattachments"]
@@ -487,6 +488,15 @@ spec:
                   name: truenas-csi-config
                   key: nodeMetricsAddr
                   optional: true
+            # Mount healer, off by default. Uncomment to restart pods whose block
+            # volume died in a storage outage, and add "delete" to the pods rule
+            # of truenas-csi-node-role. See docs/mount-heal.md.
+            # - name: TRUENAS_MOUNT_HEAL_INTERVAL
+            #   value: "1m"
+            # - name: TRUENAS_MOUNT_HEAL_COOLDOWN
+            #   value: "10m"
+            # - name: TRUENAS_KUBELET_DIR
+            #   value: "/var/lib/kubelet"
             # Outbound proxy for the TrueNAS API, unset while the keys are absent
             - name: HTTP_PROXY
               valueFrom:

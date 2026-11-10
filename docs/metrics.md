@@ -78,6 +78,7 @@ volumes without metrics. A monitoring endpoint never blocks storage operations.
 | `truenas_csi_api_call_duration_seconds` | histogram | `method` | Time each TrueNAS API call took, including any wait for a reconnect |
 | `truenas_csi_api_connected` | gauge | none | Whether the TrueNAS API WebSocket is connected (1) or not (0) |
 | `truenas_csi_api_reconnects_total` | counter | none | Successful reconnections to the TrueNAS API after a failed or lost connection |
+| `truenas_csi_mount_heal_actions_total` | counter | `action` | Node mount healer outcomes, see [mount-heal.md](mount-heal.md) |
 
 Label values:
 

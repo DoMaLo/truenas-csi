@@ -41,12 +41,12 @@ func stubStatfs(t *testing.T, flags int64, statErr error) {
 	t.Cleanup(func() { statfs = orig })
 }
 
-// stubWriteProbe replaces the mount write probe used by unusableStagedMountReason.
-func stubWriteProbe(t *testing.T, err error) {
+// stubMountProbe replaces the read probe used by unusableStagedMountReason.
+func stubMountProbe(t *testing.T, err error) {
 	t.Helper()
-	orig := writeProbeMount
-	writeProbeMount = func(string) error { return err }
-	t.Cleanup(func() { writeProbeMount = orig })
+	orig := probeMount
+	probeMount = func(string) error { return err }
+	t.Cleanup(func() { probeMount = orig })
 }
 
 // newTestNodeServer builds a NodeServer backed by a fake mounter, with all three
@@ -211,13 +211,16 @@ func TestUnusableStagedMountReason(t *testing.T) {
 		{name: "read-only mount when read-write was requested", flags: statfsFlagReadOnly, wantReason: true},
 		{name: "read-only mount when read-only was requested", flags: statfsFlagReadOnly, readOnly: true},
 		{name: "statfs failure", statErr: syscall.EIO, wantReason: true},
-		{name: "write probe failure", probeErr: syscall.EIO, wantReason: true},
+		{name: "read probe I/O error", probeErr: syscall.EIO, wantReason: true},
+		{name: "read probe I/O error on a read-only volume", probeErr: syscall.EIO, readOnly: true, wantReason: true},
+		{name: "read probe timed out", probeErr: errProbeTimeout, wantReason: true},
+		{name: "read probe error unrelated to storage", probeErr: syscall.EACCES},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			stubStatfs(t, tt.flags, tt.statErr)
-			stubWriteProbe(t, tt.probeErr)
+			stubMountProbe(t, tt.probeErr)
 			reason := unusableStagedMountReason("/staging", tt.readOnly)
 			if (reason != "") != tt.wantReason {
 				t.Errorf("unusableStagedMountReason() = %q, want a reason: %v", reason, tt.wantReason)
@@ -260,7 +263,7 @@ func TestNodeStageVolume_ReusesHealthyMount(t *testing.T) {
 	useTempConnectorDir(t)
 	staging := stagingDir(t)
 	stubStatfs(t, 0, nil)
-	stubWriteProbe(t, nil)
+	stubMountProbe(t, nil)
 
 	ns, fake := newTestNodeServer(t, []mount.MountPoint{{Device: "/dev/sda", Path: staging, Type: "ext4"}})
 
@@ -279,7 +282,7 @@ func TestNodeStageVolume_RestagesUnusableMount(t *testing.T) {
 	useTempConnectorDir(t)
 	staging := stagingDir(t)
 	stubStatfs(t, statfsFlagReadOnly, nil)
-	stubWriteProbe(t, nil)
+	stubMountProbe(t, nil)
 
 	ns, fake := newTestNodeServer(t, []mount.MountPoint{{Device: "/dev/sda", Path: staging, Type: "ext4"}})
 

@@ -186,12 +186,13 @@ func readOnlyRequested(capability *csi.VolumeCapability) bool {
 // path cannot be reused, or "" when it can be.
 //
 // A mount that outlives a storage-side interruption is left either unresponsive or
-// permanently read-only (ext4 aborts to read-only on I/O error). XFS often stays
-// read-write in statfs flags but still returns EIO on writes, so a short write
-// probe is used as well. Repairing the filesystem on the appliance does not help
-// while that mount is still in place: the staged filesystem is never re-read, so
-// every pod bind-mounted onto it keeps failing. Such a mount is re-staged instead
-// of being reused.
+// permanently read-only (ext4 aborts to read-only on I/O error). A shut-down XFS
+// keeps its read-write flag and answers statfs, so the directory is also read:
+// readdir always reaches the filesystem, which fails it with EIO once shut down.
+// Repairing the filesystem on the appliance does not help while that mount is
+// still in place: the staged filesystem is never re-read, so every pod
+// bind-mounted onto it keeps failing. Such a mount is re-staged instead of being
+// reused.
 func unusableStagedMountReason(path string, readOnly bool) string {
 	var stat syscall.Statfs_t
 	if err := statfs(path, &stat); err != nil {
@@ -200,10 +201,8 @@ func unusableStagedMountReason(path string, readOnly bool) string {
 	if !readOnly && stat.Flags&statfsFlagReadOnly != 0 {
 		return "staged filesystem is mounted read-only but read-write access was requested"
 	}
-	if !readOnly {
-		if err := writeProbeMount(path); err != nil {
-			return fmt.Sprintf("staged filesystem failed write probe: %v", err)
-		}
+	if err := probeMount(path); isDeadMountError(err) {
+		return fmt.Sprintf("staged filesystem failed a read probe: %v", err)
 	}
 	return ""
 }

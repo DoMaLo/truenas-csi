@@ -18,9 +18,9 @@ A Container Storage Interface (CSI) driver for [TrueNAS 25.10.0+](https://www.tr
 - **Prometheus metrics** - Optional `/metrics` endpoint for CSI operations and TrueNAS API health ([docs](docs/metrics.md))
 - **Private CA trust** - Verify a TrueNAS certificate issued by your own CA ([docs](docs/tls.md))
 - **Outbound proxy** - Reach the TrueNAS API through an HTTP proxy ([docs](docs/proxy.md))
-- **Mount healer (DoMaLo)** - Automatically restage dead iSCSI mounts after a network path outage ([docs](docs/mount-heal.md))
+- **Mount healer** - Optionally restart pods whose block volume died in a storage-path outage, so it is staged again ([docs](docs/mount-heal.md))
 
-> This repository is a fork of [truenas/truenas-csi](https://github.com/truenas/truenas-csi) based on **v1.4.0**, with mount-heal recovery for storage-path outages.
+> This repository is a fork of [truenas/truenas-csi](https://github.com/truenas/truenas-csi) based on **v1.4.0**, with recovery for storage-path outages.
 
 ## Requirements
 
